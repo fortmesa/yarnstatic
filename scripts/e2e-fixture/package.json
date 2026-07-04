@@ -1,0 +1,9 @@
+{
+  "name": "yarnstatic-e2e-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "lodash": "4.17.21"
+  },
+  "packageManager": "yarn@4.17.0+sha256.ea2af31ee4a6535e8559e3e1a6e34cb716112c9bed86edea71c3a5b36d472265"
+}

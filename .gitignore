@@ -1,0 +1,15 @@
+# Built yarnstatic binary, anywhere in the tree (repo root, cmd/yarnstatic, etc.)
+/yarnstatic
+**/yarnstatic-linux-*
+**/yarnstatic-darwin-*
+
+# Release workflow output
+/dist/
+
+# Go build/test artifacts
+*.test
+*.out
+
+# Editor/OS cruft
+.DS_Store
+*.swp
