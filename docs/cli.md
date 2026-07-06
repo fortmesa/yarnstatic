@@ -71,11 +71,40 @@ no scope needs the override, which is the common case. There's no flag or
 env var for this; `.yarnrc.yml` is the only source, so it can't drift out
 of sync with what the plugin itself reads.
 
+Each errored entry is also tagged with its error kind (see below), and the
+`ERRORS` section's summary line breaks the count down by kind, so a script
+doesn't have to parse individual error messages to tell "we couldn't even
+log in" apart from "these specific objects are missing."
+
 | Exit code | Meaning |
 |---|---|
 | 0 | every entry present |
-| 1 | one or more entries missing and/or S3 errors |
-| 2 | bad flags, no `yarn.lock` found, unparseable `.yarnrc.yml`, or S3 client init failure |
+| 1 | one or more entries confirmed missing from the bucket, nothing worse |
+| 2 | bad flags, too many arguments, no `yarn.lock` found, or unparseable `.yarnrc.yml` |
+| 3 | invalid S3 configuration - missing `--bucket`/`YARNSTATIC_BUCKET`, or `s3client.New`/a request failed for a locally-detectable reason (bad region, malformed `--endpoint`, a `--profile` that doesn't exist) |
+| 4 | no AWS credentials could be resolved at all on one or more entries |
+| 5 | one or more entries were denied on auth/permission grounds (and none hit 3 or 4) |
+| 6 | some other S3 error on one or more entries (throttling, a transient server error, an archived object needing a restore, ...) |
+
+When a run's errors span more than one kind, the exit code reflects the
+single most fundamental problem present, in the order listed above (3 > 4 >
+5 > 6 > 1) - e.g. if some entries are confirmed missing and others hit
+access denied, the run exits 5, not 1, since "some objects are outright
+denied" is a bigger problem than "some objects are missing," and the full
+per-kind breakdown is still in the printed report either way.
+
+**Important caveat**: AWS's own `HeadObject`/`GetObject` documentation
+states that if the calling role doesn't also have `s3:ListBucket` on the
+bucket, a request for a **missing** key returns `403 Forbidden` instead of
+`404 Not Found` - S3 won't confirm or deny an object's existence to a
+caller that can't list the bucket. With a `check`-only role scoped to just
+`s3:GetObject` (the common minimal case), every genuinely-missing entry
+will therefore show up as exit code 5 ("access denied"), not 1 - not
+because anything is actually broken, but because that's the only signal
+S3 will give back. Grant `s3:ListBucket` on the bucket too if you want
+`check`'s missing-vs-denied distinction (and its exit code) to be
+meaningful; without it, exit code 5 is ambiguous between "genuinely no
+permission" and "these are just missing."
 
 ## `yarnstatic fetch [flags] --package <name>@<version>`
 
@@ -94,8 +123,12 @@ text goes to stderr, so `fetch ... > file.tgz` is always safe.
 | Exit code | Meaning |
 |---|---|
 | 0 | tarball written successfully |
-| 1 | not found / access denied / download error |
-| 2 | bad flags, bad `--package`, or S3 client init failure |
+| 1 | not found (see `check`'s own note above on this being ambiguous with access denied if the role lacks `s3:ListBucket`) |
+| 2 | bad flags, bad `--package`, or a local (non-S3) failure writing `--out` |
+| 3 | invalid S3 configuration - missing `--bucket`/`YARNSTATIC_BUCKET`, or the same locally-detectable `s3client.New`/request failures described under `check` |
+| 4 | no AWS credentials could be resolved at all |
+| 5 | access denied |
+| 6 | some other S3 error (throttling, a transient server error, an archived object needing a restore, ...) |
 
 ## `yarnstatic serve --socket <path> [flags] [--max-concurrency N]`
 
@@ -118,12 +151,17 @@ independent of how many connections are accepted.
 | Exit code | Meaning |
 |---|---|
 | 0 | clean shutdown on `SIGINT`/`SIGTERM`/idle timeout |
-| 2 | bad flags, S3 client init failure, or failure to bind the socket |
+| 2 | bad flags, `--socket` missing, or failure to bind the socket |
+| 3 | invalid S3 configuration at startup - missing `--bucket`/`YARNSTATIC_BUCKET`, or `s3client.New` failed (bad region, malformed `--endpoint`, a `--profile` that doesn't exist) |
 
 Per-request errors are never a process exit code - they go back to the
 client as `{"ok": false, "message": "..."}` over the socket (see
 [protocol.md](protocol.md)). A single bad request never crashes the daemon
-or affects other in-flight connections.
+or affects other in-flight connections. The message text does distinguish
+not-found/access-denied/no-credentials/invalid-configuration (the same
+classification `check`/`fetch` use for their exit codes), purely so
+whatever's reading the message - typically a developer staring at a failed
+`yarn install` - has something more actionable than "download failed."
 
 ## `yarnstatic version`
 

@@ -8,13 +8,18 @@ func TestRunDispatch(t *testing.T) {
 		args []string
 		want int
 	}{
-		{"no args", []string{}, 2},
-		{"unknown command", []string{"bogus"}, 2},
-		{"help", []string{"--help"}, 0},
-		{"version", []string{"version"}, 0},
-		{"check missing bucket", []string{"check", "--bucket=", "/nonexistent"}, 2},
-		{"fetch missing package", []string{"fetch", "--bucket", "b"}, 2},
-		{"serve missing socket", []string{"serve", "--bucket", "b"}, 2},
+		{"no args", []string{}, exitUsage},
+		{"unknown command", []string{"bogus"}, exitUsage},
+		{"help", []string{"--help"}, exitOK},
+		{"version", []string{"version"}, exitOK},
+		// Missing --bucket is an invalid-configuration problem, not a
+		// usage problem - see config.go's exitConfiguration doc comment.
+		{"check missing bucket", []string{"check", "--bucket=", "/nonexistent"}, exitConfiguration},
+		{"check no yarn.lock is a usage error, not a config one", []string{"check", "--bucket", "b", "/nonexistent"}, exitUsage},
+		{"fetch missing package is a usage error (checked before --bucket)", []string{"fetch", "--bucket", "b"}, exitUsage},
+		{"fetch missing bucket", []string{"fetch", "--package", "lodash@4.17.21"}, exitConfiguration},
+		{"serve missing socket is a usage error (checked before --bucket)", []string{"serve", "--bucket", "b"}, exitUsage},
+		{"serve missing bucket", []string{"serve", "--socket", "/tmp/does-not-matter.sock"}, exitConfiguration},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

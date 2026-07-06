@@ -9,16 +9,22 @@ on:
 # restates its own `permissions:` block instead. GitHub Actions REPLACES the
 # workflow-level default with a job's own block rather than merging the two,
 # so this isn't documentation-by-omission: `release` (the only job that
-# needs contents:write) declares it explicitly, and `test`/`build` -- which
-# both implicitly fetch and run Go module dependencies via `go vet`/`go
-# test`/`go build`, the same untrusted-code exposure this pattern isolates
-# everywhere else in this org -- get nothing beyond what checkout needs.
+# needs contents:write) declares it explicitly, and every other job gets
+# nothing beyond what checkout needs.
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test
+  # The ONLY job that fetches dependencies over the network -- Go modules
+  # (go mod download) and each of the two Yarn plugin subprojects' own
+  # node_modules (yarn install --immutable, which is also the one place a
+  # compromised transitive dependency's postinstall script, the
+  # "Shai-Hulud" class of supply-chain attack, could execute). Every job
+  # after this one restores from cache instead of re-fetching, so none of
+  # them ever touch the live Go proxy or npm registry, and none of them run
+  # a dependency's install-time lifecycle script.
+  install:
+    name: Install
     runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7
@@ -28,6 +34,78 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16   # v6.5.0
         with:
           go-version-file: go.mod
+          cache: false   # explicit cache/save below instead -- see "Cache Go modules" step
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Cache Go modules for this run
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ github.sha }}
+
+      # ubuntu-slim already ships a Node version well within Yarn 4's floor,
+      # and corepack with it -- no setup-node step needed here. (Confirmed
+      # directly: every fortmesa repo using this same install/test/build
+      # split -- the verdaccio-* plugin repos -- runs this way unmodified.)
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install yarn-plugin-yarnstatic dependencies
+        working-directory: plugins/yarn-plugin-yarnstatic
+        run: yarn install --immutable
+
+      # .yarn/install-state.gz travels with node_modules so Yarn recognizes
+      # the tree as already-installed downstream and never tries an implicit
+      # revalidation-triggered network fetch of its own.
+      - name: Cache yarn-plugin-yarnstatic node_modules for this run
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            plugins/yarn-plugin-yarnstatic/node_modules
+            plugins/yarn-plugin-yarnstatic/.yarn/install-state.gz
+          key: node-modules-yarn-plugin-yarnstatic-${{ github.sha }}
+
+      - name: Install yarn-plugin-yarnstatic-s3 dependencies
+        working-directory: plugins/yarn-plugin-yarnstatic-s3
+        run: yarn install --immutable
+
+      - name: Cache yarn-plugin-yarnstatic-s3 node_modules for this run
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            plugins/yarn-plugin-yarnstatic-s3/node_modules
+            plugins/yarn-plugin-yarnstatic-s3/.yarn/install-state.gz
+          key: node-modules-yarn-plugin-yarnstatic-s3-${{ github.sha }}
+
+  # No network access: restores everything install already fetched, and
+  # GOPROXY=off/GOFLAGS=-mod=readonly turn any gap in the Go module cache
+  # into a loud failure instead of a silent live fetch (fail-on-cache-miss:
+  # true does the same job for the two node_modules restores below).
+  test:
+    name: Test
+    needs: install
+    runs-on: ubuntu-slim
+    env:
+      GOPROXY: "off"
+      GOFLAGS: "-mod=readonly"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16   # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Restore Go modules from install job
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ github.sha }}
+          fail-on-cache-miss: true
 
       - name: Vet
         run: go vet ./...
@@ -35,10 +113,47 @@ jobs:
       - name: Test
         run: go test ./...
 
-  build:
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Restore yarn-plugin-yarnstatic node_modules
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            plugins/yarn-plugin-yarnstatic/node_modules
+            plugins/yarn-plugin-yarnstatic/.yarn/install-state.gz
+          key: node-modules-yarn-plugin-yarnstatic-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      # Deliberately node test/smoke.js only, not test/cli-real.js -- that
+      # one drives real yarn 3.x/4.x releases via corepack against the real
+      # npm registry (see its own file-level comment), which is
+      # fundamentally incompatible with this job having no network access.
+      # It's a manual/local-only check, not part of this pipeline.
+      - name: Test yarn-plugin-yarnstatic
+        working-directory: plugins/yarn-plugin-yarnstatic
+        run: node test/smoke.js
+
+      - name: Restore yarn-plugin-yarnstatic-s3 node_modules
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            plugins/yarn-plugin-yarnstatic-s3/node_modules
+            plugins/yarn-plugin-yarnstatic-s3/.yarn/install-state.gz
+          key: node-modules-yarn-plugin-yarnstatic-s3-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      - name: Test yarn-plugin-yarnstatic-s3
+        working-directory: plugins/yarn-plugin-yarnstatic-s3
+        run: node test/smoke.js
+
+  build-go:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: test
+    needs: [install, test]
     runs-on: ubuntu-slim
+    env:
+      GOPROXY: "off"
+      GOFLAGS: "-mod=readonly"
     strategy:
       matrix:
         include:
@@ -58,6 +173,14 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16   # v6.5.0
         with:
           go-version-file: go.mod
+          cache: false
+
+      - name: Restore Go modules from install job
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ github.sha }}
+          fail-on-cache-miss: true
 
       # -X main.version=... matches the exact tag this release is published
       # under (same github.ref_name the `release` job's softprops/action-gh-release
@@ -81,9 +204,47 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-js:
+    name: Build ${{ matrix.plugin }}
+    needs: [install, test]
+    runs-on: ubuntu-slim
+    strategy:
+      matrix:
+        plugin:
+          - yarn-plugin-yarnstatic
+          - yarn-plugin-yarnstatic-s3
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7
+        with:
+          persist-credentials: false
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Restore node_modules from install job
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            plugins/${{ matrix.plugin }}/node_modules
+            plugins/${{ matrix.plugin }}/.yarn/install-state.gz
+          key: node-modules-${{ matrix.plugin }}-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      # Comment/whitespace-stripped bundle via @yarnpkg/builder -- see each
+      # plugin's own README for why this step exists.
+      - name: Build
+        working-directory: plugins/${{ matrix.plugin }}
+        run: yarn build
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: plugin-bundle-${{ matrix.plugin }}
+          path: plugins/${{ matrix.plugin }}/bundles/@yarnpkg/*.js
+          if-no-files-found: error
+
   release:
     name: Create release
-    needs: build
+    needs: [build-go, build-js]
     runs-on: ubuntu-slim
     permissions:
       contents: write
@@ -92,20 +253,33 @@ jobs:
         with:
           persist-credentials: false
 
+      # Pulls both build-go's yarnstatic-<goos>-<goarch> binaries and
+      # build-js's plugin-<name>.js bundles into the same flat dist/ dir.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
         with:
           path: dist
           merge-multiple: true
 
-      - name: Assemble plugin and install script
+      - name: Assemble plugins and install script
         run: |
           set -eu
-          cp plugins/yarn-plugin-yarnstatic/sources/index.js dist/plugin-yarnstatic.cjs
+          mv dist/plugin-yarnstatic.js dist/plugin-yarnstatic.cjs
+          mv dist/plugin-yarnstatic-s3.js dist/plugin-yarnstatic-s3.cjs
           cp install.sh dist/install.sh
 
       - name: Generate checksums
         working-directory: dist
         run: sha256sum * > checksums.txt
+
+      # release-s3 (below) downloads this instead of re-running the
+      # assemble/checksum steps itself -- guarantees the exact same bytes
+      # land in both the GitHub release and S3, computed once.
+      - name: Upload assembled release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: release-dist
+          path: dist/*
+          if-no-files-found: error
 
       - name: Create release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b   # v3
@@ -113,3 +287,41 @@ jobs:
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  release-s3:
+    name: Publish to S3
+    needs: release
+    runs-on: ubuntu-slim
+    # Maps to a GitHub Environment of the same name -- this is what makes
+    # gha-s3-yarnstatic's trust policy (FMDEV account, see the setup command
+    # given alongside this workflow) actually mean something: the policy
+    # checks `sub: repo:fortmesa/yarnstatic:environment:s3-release`, a claim
+    # GitHub itself mints server-side from this job's declared environment.
+    # This environment needs a TAG policy (this workflow triggers on tag
+    # push, not branch push), not the branch policy every other job in this
+    # org's workflows uses.
+    environment: s3-release
+    # Least privilege, and REPLACES (not adds to) the workflow-level
+    # default: id-token:write to mint the OIDC token below, nothing else --
+    # this job never checks out repo source, it only needs release's
+    # already-assembled dist/.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b   # v6.2.1
+        with:
+          role-to-assume: arn:aws:iam::869756787046:role/gha-s3-yarnstatic
+          aws-region: us-east-1
+
+      # Same items as the GitHub release (each plugin, the Go binary per
+      # platform, install.sh, checksums.txt), one directory per version so
+      # a re-run of this tag is idempotent (PutObject overwrite) without
+      # touching any other version's prefix.
+      - name: Publish to S3
+        run: aws s3 cp dist/ "s3://fmdev-npmjs-storage/fortmesa/yarnstatic/${{ github.ref_name }}/" --recursive

@@ -6,11 +6,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithy "github.com/aws/smithy-go"
 )
 
@@ -88,32 +88,171 @@ func (c *Client) Download(ctx context.Context, key string, w io.Writer) error {
 	return err
 }
 
-// IsNotFound reports whether err indicates the requested object doesn't
-// exist (from HeadObject or GetObject).
-func IsNotFound(err error) bool {
-	var notFound *types.NotFound
-	var noSuchKey *types.NoSuchKey
-	if errors.As(err, &notFound) || errors.As(err, &noSuchKey) {
-		return true
+// ErrorKind classifies an error from Exists/Download (or from New's own
+// config.LoadDefaultConfig call) into a coarse category a caller can act
+// on - e.g. to pick a distinct process exit code - without needing to know
+// the underlying AWS SDK error shapes itself. See Classify.
+type ErrorKind int
+
+const (
+	// KindOther covers anything not specifically recognized below:
+	// throttling (SlowDown), transient server-side failures
+	// (InternalError, ServiceUnavailable), an archived object that needs
+	// restoring first (InvalidObjectState), a network/DNS/TLS failure that
+	// never reached AWS at all, or any other condition that isn't
+	// confidently one of the more specific kinds below. The zero value,
+	// so an unclassified/default ErrorKind reads as "other" rather than
+	// as some more specific (and wrong) category.
+	KindOther ErrorKind = iota
+	// KindNotFound: the bucket or key doesn't exist (NoSuchKey, NoSuchBucket,
+	// or HeadObject's generic NotFound). See the doc comment on Classify
+	// for an important caveat: this is only reliably distinguishable from
+	// KindAccessDenied if the caller's IAM policy also grants s3:ListBucket.
+	KindNotFound
+	// KindAccessDenied: the request reached AWS and was rejected on
+	// auth/permission grounds - wrong/insufficient IAM permissions,
+	// a bad-but-present access key, a bad signature, an expired session
+	// token, clock skew, or an account-level restriction. Distinct from
+	// KindNoCredentials, which means no credentials were found to sign a
+	// request with in the first place.
+	KindAccessDenied
+	// KindNoCredentials: the SDK could not resolve any credentials at all
+	// from its default chain (env vars, shared config/credentials files,
+	// IMDS, container/web identity) - the request was never even sent,
+	// since it couldn't be signed.
+	KindNoCredentials
+	// KindConfiguration: a locally-detectable setup problem, not
+	// something AWS responded to - an invalid/empty region, a malformed
+	// --endpoint URL, or (from New) a shared config/credentials file
+	// problem such as a --profile that doesn't exist. Missing required
+	// flags (e.g. --bucket) are also this kind, though that specific case
+	// is caught before an S3 client is ever built - see cmd/yarnstatic's
+	// requireBucket.
+	KindConfiguration
+)
+
+func (k ErrorKind) String() string {
+	switch k {
+	case KindNotFound:
+		return "not found"
+	case KindAccessDenied:
+		return "access denied"
+	case KindNoCredentials:
+		return "no credentials"
+	case KindConfiguration:
+		return "invalid configuration"
+	default:
+		return "other"
 	}
+}
+
+// notFoundCodes and accessDeniedCodes are the smithy.APIError.ErrorCode()
+// values Classify recognizes - i.e. errors AWS actually responded to over
+// the wire, not a client-side failure before a request was ever sent.
+//
+// IMPORTANT caveat verified directly against AWS's own HeadObject/GetObject
+// documentation: if the request's IAM policy does not also grant
+// s3:ListBucket on the bucket, a HeadObject/GetObject for a genuinely
+// missing key returns 403 AccessDenied instead of 404 NotFound/NoSuchKey -
+// S3 will not confirm or deny an object's existence to a caller who can't
+// list the bucket. A KindAccessDenied result on a single, otherwise-normal
+// lookup can therefore mean either "no permission" OR "doesn't exist, and
+// this role can't tell you that" - the two are only reliably distinguishable
+// if s3:ListBucket is also granted. See docs/cli.md's exit code table for
+// how this affects `check`, and grant s3:ListBucket on the bucket
+// (alongside the narrower per-key s3:GetObject the role already needs) if
+// that distinction matters for your use case.
+var (
+	notFoundCodes = map[string]bool{
+		"NoSuchKey":    true,
+		"NoSuchBucket": true,
+		"NotFound":     true,
+	}
+	accessDeniedCodes = map[string]bool{
+		"AccessDenied":                true,
+		"Forbidden":                   true,
+		"InvalidAccessKeyId":          true,
+		"SignatureDoesNotMatch":       true,
+		"ExpiredToken":                true,
+		"TokenRefreshRequired":        true,
+		"InvalidToken":                true,
+		"RequestTimeTooSkewed":        true,
+		"AccountProblem":              true,
+		"AllAccessDisabled":           true,
+		"UnrecognizedClientException": true,
+	}
+)
+
+// Classify inspects err and returns the ErrorKind it belongs to.
+//
+// If err unwraps to a smithy.APIError, the request reached AWS and got a
+// structured response back - notFoundCodes/accessDeniedCodes above (this
+// covers both the SDK's own modeled error types, e.g. *types.NoSuchKey,
+// and the many error codes S3 only ever returns as an unmodeled generic
+// APIError) decide between KindNotFound, KindAccessDenied, and (for
+// anything else AWS might return - throttling, InvalidObjectState, etc.)
+// KindOther.
+//
+// Otherwise, the failure happened locally - resolving an identity/set of
+// credentials, or resolving the request's endpoint from the configured
+// region/--endpoint - before any request was ever sent. Neither failure
+// mode has a stable, exported sentinel error type in aws-sdk-go-v2 (verified
+// directly against aws-sdk-go-v2 v1.42.1 / config v1.32.27: both surface as
+// a generically-wrapped *smithy.OperationError with a plain-string cause),
+// so this falls back to matching the message text those two code paths
+// consistently produce, to tell "couldn't find any credentials"
+// (KindNoCredentials) apart from "the region/endpoint you configured
+// doesn't resolve to anything" (KindConfiguration). Re-verify these
+// substrings against the actual error text if this ever stops working
+// after an SDK upgrade - there's nothing more precise to match against.
+func Classify(err error) ErrorKind {
+	if err == nil {
+		return KindOther
+	}
+
 	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NotFound" {
-		return true
+	if errors.As(err, &apiErr) {
+		code := apiErr.ErrorCode()
+		switch {
+		case notFoundCodes[code]:
+			return KindNotFound
+		case accessDeniedCodes[code]:
+			return KindAccessDenied
+		default:
+			return KindOther
+		}
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case containsAny(msg, "resolve endpoint", "bind auth scheme params"):
+		return KindConfiguration
+	case containsAny(msg, "get credentials", "get identity", "failed to retrieve credentials", "failed to refresh cached credentials", "no ec2 imds", "no valid providers", "nocredentialproviders"):
+		return KindNoCredentials
+	default:
+		return KindOther
+	}
+}
+
+func containsAny(s string, substrs ...string) bool {
+	for _, sub := range substrs {
+		if strings.Contains(s, sub) {
+			return true
+		}
 	}
 	return false
+}
+
+// IsNotFound reports whether err indicates the requested object doesn't
+// exist (from HeadObject or GetObject). See Classify's doc comment for an
+// important caveat about when this is (and isn't) distinguishable from
+// IsAccessDenied.
+func IsNotFound(err error) bool {
+	return Classify(err) == KindNotFound
 }
 
 // IsAccessDenied reports whether err indicates a credentials/permissions
 // failure rather than a missing object or other error.
 func IsAccessDenied(err error) bool {
-	var apiErr smithy.APIError
-	if !errors.As(err, &apiErr) {
-		return false
-	}
-	switch apiErr.ErrorCode() {
-	case "AccessDenied", "Forbidden", "InvalidAccessKeyId", "SignatureDoesNotMatch":
-		return true
-	default:
-		return false
-	}
+	return Classify(err) == KindAccessDenied
 }

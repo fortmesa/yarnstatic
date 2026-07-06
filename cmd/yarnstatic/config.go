@@ -8,6 +8,47 @@ import (
 	"yarnstatic/internal/s3client"
 )
 
+// Process exit codes shared by check/fetch/serve, in increasing order of
+// "how fundamental is the thing that's wrong." A single command invocation
+// only ever needs one of these, but check aggregates results across every
+// entry in a yarn.lock, so it picks the highest-priority code among
+// everything it saw - see runCheck's own exitCodeForKind.
+//
+// exitUsage stays reserved for how the command was invoked (bad flags,
+// wrong argument count, an unparseable project file) - not how it's
+// configured to reach S3. exitConfiguration is specifically about the S3
+// connection: a missing required setting (--bucket) or something
+// s3client.Classify identifies as s3client.KindConfiguration (bad region,
+// malformed --endpoint, a --profile that doesn't exist). See
+// docs/cli.md's exit code tables.
+const (
+	exitOK            = 0
+	exitMissing       = 1 // check only: one or more entries confirmed absent from the bucket
+	exitUsage         = 2
+	exitConfiguration = 3
+	exitNoCredentials = 4
+	exitAccessDenied  = 5
+	exitOtherError    = 6
+)
+
+// exitCodeForKind maps an s3client.ErrorKind (from Classify) to the process
+// exit code that reports it - the one place this mapping is defined, so
+// check/fetch/serve can't drift out of sync on what each kind means.
+func exitCodeForKind(kind s3client.ErrorKind) int {
+	switch kind {
+	case s3client.KindNotFound:
+		return exitMissing
+	case s3client.KindConfiguration:
+		return exitConfiguration
+	case s3client.KindNoCredentials:
+		return exitNoCredentials
+	case s3client.KindAccessDenied:
+		return exitAccessDenied
+	default:
+		return exitOtherError
+	}
+}
+
 // defaultKeyPrefix matches the layout of our production Verdaccio S3
 // bucket (fmdev-npmjs-storage), so --key-prefix/YARNSTATIC_KEY_PREFIX
 // don't need to be repeated for the common case. It's applied only after

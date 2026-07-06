@@ -41,7 +41,7 @@ Flags:
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return exitUsage
 	}
 
 	path := "."
@@ -51,40 +51,45 @@ Flags:
 		path = fs.Arg(0)
 	default:
 		fmt.Fprintln(os.Stderr, "yarnstatic check: too many arguments (usage: check [flags] [path])")
-		return 2
+		return exitUsage
 	}
 
+	// requireBucket (inside resolve) is the "missing bucket name" case the
+	// exitConfiguration code exists for - see config.go.
 	bucket, keyPrefix, s3opts, err := common.resolve()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic check: %v\n", err)
-		return 2
+		return exitConfiguration
 	}
 
 	lockPath := filepath.Join(path, "yarn.lock")
 	result, err := lockfile.ParseFile(lockPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic check: %v\n", err)
-		return 2
+		return exitUsage
 	}
 
 	scopeStorage, err := loadScopeStorage(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic check: %v\n", err)
-		return 2
+		return exitUsage
 	}
 
 	printSkipSummary(os.Stdout, result)
 
 	if len(result.Entries) == 0 {
 		fmt.Println("no npm packages with checksums found to verify")
-		return 0
+		return exitOK
 	}
 
 	ctx := context.Background()
 	client, err := s3client.New(ctx, bucket, s3opts)
 	if err != nil {
+		// Anything that can fail here (bad --profile, a malformed shared
+		// config/credentials file, ...) is a setup problem, not a rejected
+		// connection attempt - see exitConfiguration's own doc comment.
 		fmt.Fprintf(os.Stderr, "yarnstatic check: failed to initialize S3 client: %v\n", err)
-		return 2
+		return exitConfiguration
 	}
 
 	fmt.Printf("Checking s3://%s/%s ...\n\n", bucket, keyPrefix)
@@ -117,10 +122,12 @@ Flags:
 
 	var missing, errored []outcome
 	present := 0
+	kindCounts := map[s3client.ErrorKind]int{}
 	for _, r := range results {
 		switch {
 		case r.err != nil:
 			errored = append(errored, r)
+			kindCounts[s3client.Classify(r.err)]++
 		case r.exists:
 			present++
 		default:
@@ -136,19 +143,59 @@ Flags:
 		fmt.Println()
 	}
 	if len(errored) > 0 {
+		// Note: without s3:ListBucket permission, an "access denied" here
+		// might actually be a missing object S3 won't confirm/deny the
+		// existence of to this role - see s3client.Classify's doc comment.
 		fmt.Printf("ERRORS (%d):\n", len(errored))
 		for _, r := range errored {
-			fmt.Printf("  %-30s %v\n", r.entry.Descriptor, r.err)
+			fmt.Printf("  %-30s [%s] %v\n", r.entry.Descriptor, s3client.Classify(r.err), r.err)
 		}
 		fmt.Println()
 	}
 
 	fmt.Printf("Summary: %d present, %d missing, %d error (out of %d checked)\n", present, len(missing), len(errored), len(results))
-
-	if len(missing) > 0 || len(errored) > 0 {
-		return 1
+	if len(errored) > 0 {
+		fmt.Printf("  errors by kind: %s\n", formatKindCounts(kindCounts))
 	}
-	return 0
+
+	// Priority order, most to least fundamental: a misconfigured
+	// connection or a wholesale inability to authenticate means nothing in
+	// this run can be trusted, so those outrank a merely-denied or
+	// merely-unclassified error, which in turn outrank a confirmed-missing
+	// object - the most common and least alarming outcome. See
+	// exitCodeForKind and config.go's own doc comment on this ordering.
+	switch {
+	case kindCounts[s3client.KindConfiguration] > 0:
+		return exitConfiguration
+	case kindCounts[s3client.KindNoCredentials] > 0:
+		return exitNoCredentials
+	case kindCounts[s3client.KindAccessDenied] > 0:
+		return exitAccessDenied
+	case kindCounts[s3client.KindOther] > 0:
+		return exitOtherError
+	case len(missing) > 0:
+		return exitMissing
+	}
+	return exitOK
+}
+
+// formatKindCounts renders a fixed, priority order (matching the exit-code
+// priority above) rather than map iteration order, so the summary line is
+// deterministic across runs.
+func formatKindCounts(counts map[s3client.ErrorKind]int) string {
+	kinds := []s3client.ErrorKind{
+		s3client.KindConfiguration,
+		s3client.KindNoCredentials,
+		s3client.KindAccessDenied,
+		s3client.KindOther,
+	}
+	var parts []string
+	for _, k := range kinds {
+		if n := counts[k]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, k))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 func printSkipSummary(w io.Writer, result *lockfile.Result) {

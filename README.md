@@ -20,6 +20,19 @@ rationale - in particular, why this *isn't* "just download the right zip
 files into `.yarn/cache`" (that approach was tried and rejected; the
 reasoning is worth reading before changing this).
 
+## Yarn version support
+
+Both plugins (`yarn-plugin-yarnstatic` and its dependency-free sibling
+`plugins/yarn-plugin-yarnstatic-s3`, which talks to S3 directly via the AWS
+SDK instead of the `serve` daemon) depend entirely on Yarn Berry's
+`wrapNetworkRequest` hook, so **only Yarn 3.x and 4.x are supported**. Yarn
+2.x doesn't have this hook at all - confirmed directly against yarn 2.4.3's
+own bundled `yarn.js` (zero references to `wrapNetworkRequest`, vs one in
+3.8.7 and two in 4.17.0). `yarn plugin import` still succeeds on 2.x with no
+error in that case; it's a silent no-op, not a loud failure, so don't rely
+on an error to catch a 2.x project. Yarn Classic (1.x) isn't Yarn Berry at
+all and was never a candidate.
+
 ## Quick start
 
 Prebuilt binaries are published on [GitHub releases](https://github.com/fortmesa/yarnstatic/releases)
@@ -70,6 +83,9 @@ Full CLI/environment-variable reference: [`docs/cli.md`](docs/cli.md).
   lifecycle.
 - [`plugins/yarn-plugin-yarnstatic/README.md`](plugins/yarn-plugin-yarnstatic/README.md) -
   consumer-facing install/wiring instructions for the plugin.
+- [`BENCHMARKS.md`](BENCHMARKS.md) - install-time comparison across both
+  plugins (daemon and direct-S3), the daemon's AWS CLI fallback path, and
+  plain `yarn`/`npm install` against the real registry.
 
 ## Development
 
@@ -86,5 +102,15 @@ what it checks and why it's a separate opt-in step rather than part of
 
 ```sh
 YARNSTATIC_BUCKET=my-verdaccio-bucket AWS_PROFILE=my-profile ./scripts/e2e-test.sh
+```
+
+`scripts/benchmark.sh` compares install wall-clock time across both
+plugins, the daemon's AWS CLI fallback, and plain `yarn`/`npm install` -
+see [`BENCHMARKS.md`](BENCHMARKS.md) for a written-up run and
+`scripts/benchmark.sh`'s own header for the full set of options. Also a
+real-infra script, not part of `go test ./...`:
+
+```sh
+YARNSTATIC_BUCKET=my-verdaccio-bucket AWS_PROFILE=my-profile ./scripts/benchmark.sh
 ```
 

@@ -5,11 +5,32 @@ network access, by serving npm tarball downloads from a private S3 bucket
 (via the `yarnstatic` Go binary) instead of the real registry. See
 [`../../docs/plugin.md`](../../docs/plugin.md) for how it works internally.
 
+## Build
+
+```sh
+yarn install
+yarn build
+```
+
+Produces `bundles/@yarnpkg/plugin-yarnstatic.js` - a minified, comment-stripped
+bundle (built via `@yarnpkg/builder`, same as
+[`../yarn-plugin-yarnstatic-s3`](../yarn-plugin-yarnstatic-s3)). This has no
+external dependency to inline (only Node built-ins and `@yarnpkg/core`,
+both left external), so the build's only value is a smaller, comment-free
+distributable - functionally identical to `sources/index.js`.
+
 ## Install
 
-Per-project (most common):
+Per-project (most common), using either `yarn plugin import` against the
+built bundle:
 
-1. Copy `sources/index.js` into your project as `.yarn/plugins/plugin-yarnstatic.cjs`.
+```sh
+yarn plugin import /path/to/bundles/@yarnpkg/plugin-yarnstatic.js
+```
+
+or by hand:
+
+1. Copy `bundles/@yarnpkg/plugin-yarnstatic.js` into your project as `.yarn/plugins/plugin-yarnstatic.cjs`.
 2. Add it to your project's `.yarnrc.yml`:
 
    ```yaml

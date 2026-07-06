@@ -68,24 +68,28 @@ Flags:
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return exitUsage
 	}
 	if socketPath == "" {
 		fmt.Fprintln(os.Stderr, "yarnstatic serve: --socket is required")
-		return 2
+		return exitUsage
 	}
 
+	// requireBucket (inside resolve) is the "missing bucket name" case the
+	// exitConfiguration code exists for - see config.go. This only affects
+	// serve's own STARTUP: once running, a per-request failure never
+	// changes serve's exit code - see describeDownloadError below.
 	bucket, keyPrefix, s3opts, err := common.resolve()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic serve: %v\n", err)
-		return 2
+		return exitConfiguration
 	}
 
 	ctx := context.Background()
 	client, err := s3client.New(ctx, bucket, s3opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic serve: failed to initialize S3 client: %v\n", err)
-		return 2
+		return exitConfiguration
 	}
 
 	_ = os.Remove(socketPath) // defensive: clear a stale socket file, if any
@@ -93,7 +97,7 @@ Flags:
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic serve: failed to listen on %s: %v\n", socketPath, err)
-		return 2
+		return exitUsage
 	}
 	defer os.Remove(socketPath)
 
@@ -335,12 +339,27 @@ func writeJSONLine(conn net.Conn, resp response) error {
 	return err
 }
 
+// describeDownloadError only ever feeds into the per-request
+// {"ok": false, "message": "..."} response (see docs/protocol.md) - a
+// per-request failure is never a distinct process exit code, unlike
+// check/fetch. Richer classification here (KindNoCredentials/
+// KindConfiguration, not just the original not-found/access-denied) is
+// purely to make that message text more actionable for whoever's staring
+// at a failed `yarn install`; it doesn't change serve's protocol or
+// behavior otherwise.
 func describeDownloadError(err error, key string) string {
-	switch {
-	case s3client.IsNotFound(err):
+	switch s3client.Classify(err) {
+	case s3client.KindNotFound:
+		// Note: without s3:ListBucket permission this might actually come
+		// back as KindAccessDenied instead - see s3client.Classify's doc
+		// comment.
 		return fmt.Sprintf("not found: %s", key)
-	case s3client.IsAccessDenied(err):
+	case s3client.KindAccessDenied:
 		return fmt.Sprintf("access denied: %s", key)
+	case s3client.KindNoCredentials:
+		return fmt.Sprintf("no credentials available to sign the request: %v", err)
+	case s3client.KindConfiguration:
+		return fmt.Sprintf("invalid configuration: %v", err)
 	default:
 		return fmt.Sprintf("download failed: %v", err)
 	}

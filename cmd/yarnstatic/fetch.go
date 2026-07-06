@@ -30,34 +30,36 @@ Flags:
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return exitUsage
 	}
 	if fs.NArg() > 0 {
 		fmt.Fprintln(os.Stderr, "yarnstatic fetch: unexpected arguments")
-		return 2
+		return exitUsage
 	}
 	if pkg == "" {
 		fmt.Fprintln(os.Stderr, "yarnstatic fetch: --package is required")
-		return 2
+		return exitUsage
 	}
 
 	spec, err := verdaccio.ParsePackageSpec(pkg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic fetch: %v\n", err)
-		return 2
+		return exitUsage
 	}
 
+	// requireBucket (inside resolve) is the "missing bucket name" case the
+	// exitConfiguration code exists for - see config.go.
 	bucket, keyPrefix, s3opts, err := common.resolve()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic fetch: %v\n", err)
-		return 2
+		return exitConfiguration
 	}
 
 	ctx := context.Background()
 	client, err := s3client.New(ctx, bucket, s3opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic fetch: failed to initialize S3 client: %v\n", err)
-		return 2
+		return exitConfiguration
 	}
 
 	var w io.Writer = os.Stdout
@@ -65,7 +67,7 @@ Flags:
 		f, err := os.Create(out)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "yarnstatic fetch: %v\n", err)
-			return 2
+			return exitUsage
 		}
 		defer f.Close()
 		w = f
@@ -79,16 +81,24 @@ Flags:
 		if out != "" {
 			_ = os.Remove(out)
 		}
-		switch {
-		case s3client.IsNotFound(err):
+		kind := s3client.Classify(err)
+		switch kind {
+		case s3client.KindNotFound:
+			// Note: without s3:ListBucket permission this might actually
+			// come back as KindAccessDenied instead - see
+			// s3client.Classify's doc comment.
 			fmt.Fprintf(os.Stderr, "yarnstatic fetch: not found: s3://%s/%s (package %s)\n", bucket, key, spec)
-		case s3client.IsAccessDenied(err):
+		case s3client.KindAccessDenied:
 			fmt.Fprintf(os.Stderr, "yarnstatic fetch: access denied: s3://%s/%s\n", bucket, key)
+		case s3client.KindNoCredentials:
+			fmt.Fprintf(os.Stderr, "yarnstatic fetch: no credentials available to sign the request: %v\n", err)
+		case s3client.KindConfiguration:
+			fmt.Fprintf(os.Stderr, "yarnstatic fetch: invalid configuration: %v\n", err)
 		default:
 			fmt.Fprintf(os.Stderr, "yarnstatic fetch: failed to download s3://%s/%s: %v\n", bucket, key, err)
 		}
-		return 1
+		return exitCodeForKind(kind)
 	}
 
-	return 0
+	return exitOK
 }
