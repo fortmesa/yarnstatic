@@ -11,6 +11,7 @@ func TestRunDispatch(t *testing.T) {
 		{"no args", []string{}, 2},
 		{"unknown command", []string{"bogus"}, 2},
 		{"help", []string{"--help"}, 0},
+		{"version", []string{"version"}, 0},
 		{"check missing bucket", []string{"check", "--bucket=", "/nonexistent"}, 2},
 		{"fetch missing package", []string{"fetch", "--bucket", "b"}, 2},
 		{"serve missing socket", []string{"serve", "--bucket", "b"}, 2},

@@ -125,6 +125,23 @@ client as `{"ok": false, "message": "..."}` over the socket (see
 [protocol.md](protocol.md)). A single bad request never crashes the daemon
 or affects other in-flight connections.
 
+## `yarnstatic version`
+
+Prints the version this binary was built at and exits 0 - nothing else,
+no flags. A binary built via a plain `go build`/`go test`/`go run`
+(local development, or the `test` job's own `go vet`/`go test`, which
+never runs the release build step at all) reports `dev`, since there's no
+real release tag to embed at that point.
+
+A release binary gets its version baked in at build time
+(`-ldflags "-X main.version=..."` in `.github/workflows/release.yml`'s
+`build` job), set to the exact git tag (`github.ref_name`) that release is
+published under - the same value `softprops/action-gh-release` uses for
+the release itself, so a binary's own `yarnstatic version` output and the
+GitHub Release it was downloaded from can never disagree. Useful for
+confirming exactly which build ended up on a given machine/CI runner,
+independent of whatever URL or script fetched it.
+
 ## Manual verification (no AWS access needed for the plumbing)
 
 You can sanity-check `serve`'s socket handling without real S3 credentials

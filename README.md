@@ -5,10 +5,11 @@ serving npm tarballs from a private S3 bucket (a Verdaccio registry's
 storage backend) instead of the real npm registry.
 
 Two parts:
-- **`yarnstatic`** (this Go module) - a CLI with three subcommands:
+- **`yarnstatic`** (this Go module) - a CLI with four subcommands:
   `check` (verify everything a `yarn.lock` needs exists in S3), `fetch`
-  (one-shot manual download), and `serve` (a small daemon that a Yarn
-  plugin talks to during install).
+  (one-shot manual download), `serve` (a small daemon that a Yarn plugin
+  talks to during install), and `version` (prints the release tag this
+  binary was built at, for debugging which build ended up where).
 - **A companion Yarn Berry plugin** (`plugins/yarn-plugin-yarnstatic`) that
   intercepts npm tarball downloads and redirects them to the `serve`
   daemon, while leaving all of Yarn's own zip-building and checksum logic
@@ -60,8 +61,8 @@ Full CLI/environment-variable reference: [`docs/cli.md`](docs/cli.md).
   way it is, including the rejected direct-zip-construction approach.
 - [`docs/s3-layout.md`](docs/s3-layout.md) - the Verdaccio S3 key layout
   this tool relies on.
-- [`docs/cli.md`](docs/cli.md) - `check`/`fetch`/`serve` usage, full flag
-  and environment variable reference, exit codes.
+- [`docs/cli.md`](docs/cli.md) - `check`/`fetch`/`serve`/`version` usage,
+  full flag and environment variable reference, exit codes.
 - [`docs/protocol.md`](docs/protocol.md) - the `serve` daemon's wire
   protocol (shared source of truth for the Go server and JS client).
 - [`docs/plugin.md`](docs/plugin.md) - how the Yarn plugin works
