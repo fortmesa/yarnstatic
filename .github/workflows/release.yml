@@ -353,7 +353,13 @@ jobs:
 
   publish-npm:
     name: Publish @fortmesa/yarnstatic to npm
-    needs: test
+    # Depends on build-js (not just test) so there is exactly one build of
+    # yarn-plugin-yarnstatic-s3's bundle for this whole workflow run --
+    # reused here via download-artifact below, never rebuilt independently.
+    # Two separate builds of the same source, one in build-js and one
+    # redone here, would mean two places a build failure could originate
+    # and no single answer for "which build is the one that shipped."
+    needs: build-js
     runs-on: ubuntu-slim
     permissions:
       contents: read
@@ -375,18 +381,16 @@ jobs:
           key: node-modules-cli-node-${{ github.sha }}
           fail-on-cache-miss: true
 
-      # cli-node's own "prepack" script (which `yarn npm publish` runs
-      # automatically) builds yarn-plugin-yarnstatic-s3's bundle fresh via
-      # `yarn build` in that directory -- needs its node_modules too, same
-      # cache the install job already populated.
-      - name: Restore yarn-plugin-yarnstatic-s3 node_modules from install job
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+      # The one build of yarn-plugin-yarnstatic-s3's bundle, already done by
+      # build-js -- placed at exactly the path cli-node's own prepack script
+      # (scripts/build-plugin-bundle.js) checks first, so its
+      # needsBuild() sees an up-to-date bundle already present and copies
+      # it into cli-node/plugin/ instead of invoking `yarn build` again.
+      - name: Download pre-built yarn-plugin-yarnstatic-s3 bundle from build-js
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
         with:
-          path: |
-            plugins/yarn-plugin-yarnstatic-s3/node_modules
-            plugins/yarn-plugin-yarnstatic-s3/.yarn/install-state.gz
-          key: node-modules-yarn-plugin-yarnstatic-s3-${{ github.sha }}
-          fail-on-cache-miss: true
+          name: plugin-bundle-yarn-plugin-yarnstatic-s3
+          path: plugins/yarn-plugin-yarnstatic-s3/bundles/@yarnpkg
 
       # npmjs.dev.fort.blue (via verdaccio-oidc-auth) verifies a GitHub
       # Actions OIDC token directly as a bearer credential -- no OAuth
