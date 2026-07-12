@@ -134,3 +134,9 @@ for the daemon's spawn/reuse/teardown lifecycle.
   streamed downloads, error classification).
 - **`plugins/yarn-plugin-yarnstatic`** (JS) - the Yarn plugin described
   above. See [plugin.md](plugin.md).
+- **`cli-node`** (JS) - a Node.js port of `cmd/yarnstatic`, same four
+  subcommands including `serve` against the identical wire protocol (see
+  [protocol.md](protocol.md)), published as `@fortmesa/yarnstatic`. Not a
+  replacement for the Go binary - an alternative for Node-only
+  environments, and bundles `yarn-plugin-yarnstatic-s3` for a
+  daemon-free setup. See [`../cli-node/README.md`](../cli-node/README.md).

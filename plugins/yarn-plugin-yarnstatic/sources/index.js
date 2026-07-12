@@ -454,7 +454,7 @@ function scopeOf(packageSpec) {
 // ---------------------------------------------------------------------------
 
 // Matches cmd/yarnstatic/config.go's defaultKeyPrefix exactly -- the
-// layout of the production Verdaccio S3 bucket (fmdev-npmjs-storage).
+// layout of the production Verdaccio S3 bucket (your-s3-bucket).
 const DEFAULT_KEY_PREFIX = 'verdaccio';
 
 /**

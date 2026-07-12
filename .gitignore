@@ -13,3 +13,5 @@
 # Editor/OS cruft
 .DS_Store
 *.swp
+node_modules
+.yarn

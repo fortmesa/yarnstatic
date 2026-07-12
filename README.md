@@ -4,7 +4,7 @@ Lets `yarn install --immutable` run with **zero network access**, by
 serving npm tarballs from a private S3 bucket (a Verdaccio registry's
 storage backend) instead of the real npm registry.
 
-Two parts:
+Three parts:
 - **`yarnstatic`** (this Go module) - a CLI with four subcommands:
   `check` (verify everything a `yarn.lock` needs exists in S3), `fetch`
   (one-shot manual download), `serve` (a small daemon that a Yarn plugin
@@ -14,6 +14,15 @@ Two parts:
   intercepts npm tarball downloads and redirects them to the `serve`
   daemon, while leaving all of Yarn's own zip-building and checksum logic
   untouched.
+- **`cli-node`** - a Node.js port of the Go CLI with the same four
+  subcommands, published as the npm package `@fortmesa/yarnstatic` (bin
+  name `yarnstatic`), for environments that have Node but not Go. Its
+  `serve` implements the exact same wire protocol as the Go daemon (see
+  [`docs/protocol.md`](docs/protocol.md)), verified as a genuine drop-in
+  replacement against the unmodified `yarn-plugin-yarnstatic` plugin
+  client. It also bundles `yarn-plugin-yarnstatic-s3` (below) for a
+  self-contained, Node-only setup with no daemon at all. See
+  [`cli-node/README.md`](cli-node/README.md).
 
 See [`docs/architecture.md`](docs/architecture.md) for the full design
 rationale - in particular, why this *isn't* "just download the right zip
@@ -83,6 +92,9 @@ Full CLI/environment-variable reference: [`docs/cli.md`](docs/cli.md).
   lifecycle.
 - [`plugins/yarn-plugin-yarnstatic/README.md`](plugins/yarn-plugin-yarnstatic/README.md) -
   consumer-facing install/wiring instructions for the plugin.
+- [`cli-node/README.md`](cli-node/README.md) - the Node.js CLI port
+  (`@fortmesa/yarnstatic`): install, usage, and its bundled
+  `yarn-plugin-yarnstatic-s3` wiring step.
 - [`BENCHMARKS.md`](BENCHMARKS.md) - install-time comparison across both
   plugins (daemon and direct-S3), the daemon's AWS CLI fallback path, and
   plain `yarn`/`npm install` against the real registry.

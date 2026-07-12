@@ -79,6 +79,18 @@ jobs:
             plugins/yarn-plugin-yarnstatic-s3/.yarn/install-state.gz
           key: node-modules-yarn-plugin-yarnstatic-s3-${{ github.sha }}
 
+      - name: Install cli-node dependencies
+        working-directory: cli-node
+        run: yarn install --immutable
+
+      - name: Cache cli-node node_modules for this run
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            cli-node/node_modules
+            cli-node/.yarn/install-state.gz
+          key: node-modules-cli-node-${{ github.sha }}
+
   # No network access: restores everything install already fetched, and
   # GOPROXY=off/GOFLAGS=-mod=readonly turn any gap in the Go module cache
   # into a loud failure instead of a silent live fetch (fail-on-cache-miss:
@@ -145,6 +157,19 @@ jobs:
 
       - name: Test yarn-plugin-yarnstatic-s3
         working-directory: plugins/yarn-plugin-yarnstatic-s3
+        run: node test/smoke.js
+
+      - name: Restore cli-node node_modules
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            cli-node/node_modules
+            cli-node/.yarn/install-state.gz
+          key: node-modules-cli-node-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      - name: Test cli-node
+        working-directory: cli-node
         run: node test/smoke.js
 
   build-go:
@@ -325,3 +350,95 @@ jobs:
       # touching any other version's prefix.
       - name: Publish to S3
         run: aws s3 cp dist/ "s3://fmdev-npmjs-storage/fortmesa/yarnstatic/${{ github.ref_name }}/" --recursive
+
+  publish-npm:
+    name: Publish @fortmesa/yarnstatic to npm
+    needs: test
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7
+        with:
+          persist-credentials: false
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Restore cli-node node_modules from install job
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            cli-node/node_modules
+            cli-node/.yarn/install-state.gz
+          key: node-modules-cli-node-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      # cli-node's own "prepack" script (which `yarn npm publish` runs
+      # automatically) builds yarn-plugin-yarnstatic-s3's bundle fresh via
+      # `yarn build` in that directory -- needs its node_modules too, same
+      # cache the install job already populated.
+      - name: Restore yarn-plugin-yarnstatic-s3 node_modules from install job
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            plugins/yarn-plugin-yarnstatic-s3/node_modules
+            plugins/yarn-plugin-yarnstatic-s3/.yarn/install-state.gz
+          key: node-modules-yarn-plugin-yarnstatic-s3-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      # npmjs.dev.fort.blue (via verdaccio-oidc-auth) verifies a GitHub
+      # Actions OIDC token directly as a bearer credential -- no OAuth
+      # exchange, no browser. Same pattern already used by
+      # verdaccio-security-filter's own release.yml for this same registry.
+      - name: Get OIDC token for npmjs.dev.fort.blue
+        id: oidc
+        run: |
+          set -eu
+          TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://npmjs.dev.fort.blue" \
+            | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).value))')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      # working-directory: cli-node so this writes to cli-node/.yarnrc.yml
+      # (this job's ephemeral checkout) -- cli-node is the actual yarn
+      # project here, since the repo root itself is a Go module with no
+      # yarn project of its own. Never written to any committed config.
+      - name: Configure npm registry for @fortmesa scope
+        working-directory: cli-node
+        env:
+          NPM_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -eu
+          yarn config set 'npmScopes.fortmesa.npmRegistryServer' 'https://npmjs.dev.fort.blue'
+          yarn config set 'npmScopes.fortmesa.npmPublishRegistry' 'https://npmjs.dev.fort.blue'
+          yarn config set 'npmScopes.fortmesa.npmAlwaysAuth' true
+          yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
+
+      # cli-node/package.json's version is independent of this repo's own
+      # v*.*.* git tags (same as yarn-plugin-yarnstatic-s3's own
+      # package.json version already is -- neither plugin's version is
+      # tied to the Go binary's release tag). Most tags won't bump it, and
+      # npm rejects republishing an already-published version outright, so
+      # skip cleanly here instead of failing the whole release whenever
+      # there's nothing new to publish.
+      - name: Check whether this version is already published
+        id: version-check
+        working-directory: cli-node
+        run: |
+          set -eu
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          if yarn npm info "@fortmesa/yarnstatic@$LOCAL_VERSION" --json >/dev/null 2>&1; then
+            echo "@fortmesa/yarnstatic@$LOCAL_VERSION is already published -- skipping"
+            echo "should-publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "@fortmesa/yarnstatic@$LOCAL_VERSION is not yet published -- will publish"
+            echo "should-publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npmjs.dev.fort.blue
+        if: steps.version-check.outputs.should-publish == 'true'
+        working-directory: cli-node
+        run: yarn npm publish --access public

@@ -1,5 +1,15 @@
 # CLI reference
 
+This document is written against the Go binary (`cmd/yarnstatic`). A
+Node.js port with the same four subcommands, flags, environment variables,
+and exit codes exists at `cli-node/` (published as `@fortmesa/yarnstatic`)
+- see [`../cli-node/README.md`](../cli-node/README.md). The one documented
+behavioral difference: a `--profile` that doesn't exist fails at S3
+*client construction* in the Go binary (exit code 3, `exitConfiguration`),
+but the Node port's AWS SDK resolves credentials lazily, so the same
+failure only surfaces on the first request there, as exit code 4
+(`exitNoCredentials`) instead of 3.
+
 ## Configuration: flags and environment variables
 
 Every *connection* setting is an environment variable first; each

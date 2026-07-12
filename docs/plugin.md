@@ -113,10 +113,22 @@ one consumer at once (see [protocol.md](protocol.md)'s "why this shape").
    image's `/usr/local/bin`.
 
 `projectRoot` is taken from `extra.configuration.projectCwd` when
-available, falling back to `process.cwd()`. This project deliberately does
-not publish an npm package for the binary (cross-platform builds, hosting,
-and a publish pipeline are a separate concern) - candidate 2 is checked
-anyway since it's free and harmless if nothing's ever there.
+available, falling back to `process.cwd()`.
+
+Candidate 2 (`node_modules/.bin/yarnstatic`) is no longer just a harmless
+check against an empty path: `cli-node/` is a Node.js port of the Go CLI,
+published as the npm package `@fortmesa/yarnstatic` (bin name `yarnstatic`
+- see [`../cli-node/README.md`](../cli-node/README.md)), and it implements
+`serve` against the exact same wire protocol documented in
+[protocol.md](protocol.md). A project with `@fortmesa/yarnstatic` installed
+as a devDependency gets this binary at exactly that path, and
+`resolveBinary()` will find and spawn it - a genuine, verified drop-in
+replacement for the Go daemon from this plugin's point of view, not just a
+theoretical possibility. `cli-node/` deliberately bundles only
+`yarn-plugin-yarnstatic-s3` (see its own README), not this plugin - a
+project that wants this plugin's daemon path with the Node binary needs
+`yarn-plugin-yarnstatic` from this repo directly (or `YARNSTATIC_BIN`
+pointed explicitly at the Node binary).
 
 No Windows-specific paths are checked. This is CI/CD-only tooling (not
 something installed on developer desktops), and Windows CI runners are not
@@ -197,7 +209,7 @@ the resolved `{body, statusCode, headers}`), `parseTarballUrl`,
 greeting-then-request-then-response exchange - has been exercised live,
 repeatedly, via `scripts/e2e-test.sh`: a real Yarn Berry 4.17.0 project,
 the actual plugin file, a real `yarnstatic serve` daemon, against the real
-`fmdev-npmjs-storage` S3 bucket, with the global cache disabled and
+`your-s3-bucket` S3 bucket, with the global cache disabled and
 `.yarn/cache` cleared each run to force a genuine fetch. This covers the
 JSON protocol (not the old plain-text format), the greeting/version
 negotiation handshake, and the no-`storageFolder` path end-to-end -

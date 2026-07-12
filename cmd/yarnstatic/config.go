@@ -50,7 +50,7 @@ func exitCodeForKind(kind s3client.ErrorKind) int {
 }
 
 // defaultKeyPrefix matches the layout of our production Verdaccio S3
-// bucket (fmdev-npmjs-storage), so --key-prefix/YARNSTATIC_KEY_PREFIX
+// bucket (your-s3-bucket), so --key-prefix/YARNSTATIC_KEY_PREFIX
 // don't need to be repeated for the common case. It's applied only after
 // both the flag and the env var resolve to empty, in resolve() below - not
 // as the flag's own registered default - so that "flag wins over env var"

@@ -5,7 +5,7 @@ the `verdaccio-aws-s3-storage` plugin (verified against its v12.1.1
 source - `S3PackageManager.writeTarball`/`readTarball` and
 `@verdaccio/core`'s `composeTarballFromPackage`). This has also been
 confirmed directly against a real production bucket
-(`fmdev-npmjs-storage`) via `aws s3 ls` - both the unscoped
+(`your-s3-bucket`) via `aws s3 ls` - both the unscoped
 (`lodash/lodash-4.18.1.tgz`) and scoped (`@babel/core/core-7.28.3.tgz`)
 layouts, and a non-empty `keyPrefix` (`verdaccio/`) in active use - matched
 `TarballKey`'s output exactly.

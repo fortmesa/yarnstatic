@@ -1,6 +1,6 @@
 {
   "name": "yarn-plugin-yarnstatic",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "Yarn Berry plugin: intercepts npm tarball downloads and serves them from a private S3 bucket via a local `yarnstatic serve` daemon (falling back to a direct `aws s3 cp` if that binary can't be found/started), so `yarn install --immutable` can run fully offline.",
   "license": "MIT",
@@ -10,7 +10,7 @@
   },
   "devDependencies": {
     "@yarnpkg/builder": "^4.2.3",
-    "@yarnpkg/cli": "^4.17.0",
+    "@yarnpkg/cli": "^4.17.1",
     "@yarnpkg/core": "^4.9.0"
   }
 }

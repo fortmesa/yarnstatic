@@ -1,2 +1,7 @@
 node_modules/
 .yarn/install-state.gz
+
+# Build output (yarn build / builder build plugin) -- release.yml rebuilds
+# this fresh for every release rather than reading a committed copy, and a
+# committed copy can silently drift stale against sources/index.js.
+bundles/

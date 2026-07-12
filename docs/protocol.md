@@ -8,6 +8,14 @@ framing library needed, since opening a new Unix socket connection is cheap
 (a local `connect()` syscall) and concurrent fetches just use concurrent
 connections.
 
+There are now two server implementations of this exact protocol: the Go
+`cmd/yarnstatic serve` command, and `cli-node`'s `commands/serve.js` (the
+Node.js port, published as `@fortmesa/yarnstatic` - see
+[`../cli-node/README.md`](../cli-node/README.md)). Both were verified
+against the plugin's own client code unmodified - a change to this
+protocol needs to stay compatible with (or update) both server
+implementations, not just the Go one.
+
 ## Transport
 
 A Unix domain socket. The path is chosen by whoever spawns `yarnstatic
