@@ -28,6 +28,48 @@ PROJECT_DIR="${1:-$PWD}"
 say() { printf '%s\n' "$*"; }
 die() { printf 'yarnstatic install: %s\n' "$*" >&2; exit 1; }
 
+# checksums.txt is published alongside every release (see
+# .github/workflows/release.yml's "Generate checksums" step -- `sha256sum *`
+# run over the exact same dist/ dir whose contents become both the GitHub
+# release assets and the S3 upload), so there's already a trust anchor here;
+# this just wires downloads up to actually check against it, rather than
+# trusting HTTPS + GitHub hosting alone.
+CHECKSUMS_FILE=""
+
+fetch_checksums() {
+  [ -n "$CHECKSUMS_FILE" ] && return 0
+  CHECKSUMS_FILE=$(mktemp)
+  trap 'rm -f "$CHECKSUMS_FILE"' EXIT
+  curl -fsSL "https://github.com/$REPO/releases/download/$VERSION/checksums.txt" \
+    -o "$CHECKSUMS_FILE" \
+    || die "could not fetch checksums.txt for $VERSION"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    die "no sha256sum/shasum available to verify downloaded file integrity"
+  fi
+}
+
+# Verifies $file (already downloaded to disk) against its entry for $name in
+# this release's checksums.txt. Fails loud on a mismatch or a missing entry
+# -- a checksum file present but silent about the one file being installed
+# is exactly as unsafe as no checksum file at all.
+verify_checksum() {
+  file="$1"
+  name="$2"
+  fetch_checksums
+  expected=$(grep " $name\$" "$CHECKSUMS_FILE" | awk '{print $1}')
+  [ -n "$expected" ] || die "no checksum entry for $name in checksums.txt"
+  actual=$(sha256_of "$file")
+  [ "$expected" = "$actual" ] \
+    || die "checksum mismatch for $name (expected $expected, got $actual) -- refusing to install"
+}
+
 detect_platform() {
   case "$(uname -s)" in
     Linux) goos="linux" ;;
@@ -62,6 +104,7 @@ install_binary() {
   mkdir -p "$BIN_DIR"
   say "Downloading $asset ($VERSION)..."
   curl -fsSL "$url" -o "$BIN_DIR/yarnstatic"
+  verify_checksum "$BIN_DIR/yarnstatic" "$asset"
   chmod +x "$BIN_DIR/yarnstatic"
   say "Installed yarnstatic to $BIN_DIR/yarnstatic"
 
@@ -103,6 +146,7 @@ install_plugin() {
   say "Installing the plugin manually to $plugin_path..."
   mkdir -p "$plugin_dir"
   curl -fsSL "$plugin_url" -o "$plugin_path"
+  verify_checksum "$plugin_path" "plugin-yarnstatic.cjs"
   say "Installed plugin to $plugin_path"
 
   if grep -q "plugin-yarnstatic.cjs" "$yarnrc" 2>/dev/null; then

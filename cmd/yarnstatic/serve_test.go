@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -153,4 +156,51 @@ func TestGreetingShape(t *testing.T) {
 			t.Fatalf("field %q: got %v, want %v (full: %v)", k, got[k], v, got)
 		}
 	}
+}
+
+// TestListenOnUnixSocketRestrictsPermissions is the actual regression test
+// for the fix: under a permissive umask (0, common in root-run
+// containers/some CI images) that would otherwise leave the socket
+// world-writable, listenOnUnixSocket() must still produce a 0600 socket.
+// Explicitly sets umask 0 rather than trusting whatever the test runner
+// happens to have, so this fails loudly if the chmod is ever removed
+// instead of silently depending on the ambient environment.
+func TestListenOnUnixSocketRestrictsPermissions(t *testing.T) {
+	oldUmask := syscall.Umask(0)
+	defer syscall.Umask(oldUmask)
+
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "test.sock")
+
+	listener, err := listenOnUnixSocket(socketPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer listener.Close()
+
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		t.Fatalf("unexpected error stat'ing socket: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("socket permissions = %#o, want 0600 (umask was set to 0, so without the chmod this would be 0777)", got)
+	}
+}
+
+// TestListenOnUnixSocketClearsStaleSocketFile confirms the pre-existing
+// "remove a stale socket file left by a crashed prior run" behavior still
+// works after extracting this into its own function.
+func TestListenOnUnixSocketClearsStaleSocketFile(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "test.sock")
+
+	if err := os.WriteFile(socketPath, []byte("stale"), 0644); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	listener, err := listenOnUnixSocket(socketPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer listener.Close()
 }

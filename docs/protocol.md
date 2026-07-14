@@ -22,6 +22,15 @@ A Unix domain socket. The path is chosen by whoever spawns `yarnstatic
 serve --socket <path>` - the plugin generates a fresh temp path per `yarn`
 process (see [plugin.md](plugin.md)).
 
+**Permissions**: both `serve` implementations `chmod` the socket file to
+`0600` immediately after binding, regardless of the process umask. Without
+this, a permissive umask (0 or 002, common in root-run containers/some CI
+images) would leave the socket group/world-writable - the daemon has no
+per-caller/per-project scoping by design (see "Why this shape" below), so
+any other local process able to connect could request any `package@version`
+(and arbitrary `storageFolder`) this daemon's own AWS credentials can reach.
+0600 restricts connections to the same OS user that started the daemon.
+
 ## Greeting
 
 Before anything else, on **every** accepted connection - including the

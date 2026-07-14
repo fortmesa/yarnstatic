@@ -572,6 +572,57 @@ __metadata:
     assert.equal(fs.existsSync(socketPath), false, 'socket file should be removed after shutdown');
   });
 
+  await check('serve: socket file permissions are restricted to 0600, regardless of umask', async () => {
+    const {runServe} = require('../src/commands/serve');
+    const socketPath = path.join(os.tmpdir(), `yarnstatic-test-${process.pid}-${Date.now()}.sock`);
+
+    // Explicitly set a permissive umask rather than trusting whatever the
+    // test runner happens to have -- proves the chmod happens regardless
+    // of umask, not just "happens to work under this environment's own".
+    const oldUmask = process.umask(0);
+    let servePromise;
+    try {
+      sendImpl = async () => ({Body: (async function* () {})()});
+      servePromise = runServe(['--bucket', 'test-bucket', '--socket', socketPath]);
+
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(socketPath)) {
+        if (Date.now() > deadline) {
+          throw new Error('serve did not create its socket in time');
+        }
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+
+      // fs.existsSync can see the socket file the instant bind() creates
+      // it, which lands *before* runServe's own continuation (chmod, then
+      // registering its SIGINT/SIGTERM handlers) has necessarily run --
+      // confirmed directly: emitting SIGINT immediately after existsSync
+      // first returns true is silently dropped often enough to hang the
+      // test, because there's no listener yet. A real connection can only
+      // succeed once the server is actually accept()-ing, which is well
+      // past that point (chmod and handler registration are still earlier,
+      // synchronous steps in the same continuation) -- a robust
+      // synchronization point instead of an arbitrary delay.
+      await new Promise((resolve, reject) => {
+        const probe = net.createConnection(socketPath);
+        probe.on('connect', () => probe.end(resolve));
+        probe.on('error', reject);
+      });
+
+      const mode = fs.statSync(socketPath).mode & 0o777;
+      assert.equal(
+        mode,
+        0o600,
+        `socket permissions = 0${mode.toString(8)}, want 0600 ` +
+          '(umask was set to 0, so without the chmod this would be 0777)',
+      );
+    } finally {
+      process.umask(oldUmask);
+      process.emit('SIGINT');
+      if (servePromise) await servePromise;
+    }
+  });
+
   console.log(`\n${passed} passed, ${failed} failed.`);
   process.exitCode = failed > 0 ? 1 : 0;
 }

@@ -45,6 +45,35 @@ const (
 	minSupportedProtocolVersion = "1.0"
 )
 
+// listenOnUnixSocket binds socketPath and restricts it to 0600 before
+// returning -- net.Listen alone creates the socket file with permissions
+// derived only from the process umask, which under a permissive umask (0 or
+// 002, common in root-run containers/some CI images) would leave it
+// group/world writable. This daemon has no per-caller/per-project scoping
+// by design (see docs/protocol.md's "Why this shape"), so any other local
+// process able to connect could request any package@version (and arbitrary
+// storageFolder) this daemon's own AWS credentials can reach. 0600
+// restricts connections to the same OS user that started the daemon,
+// regardless of umask. Extracted from runServe() specifically so this
+// security property is directly unit-testable without needing a working S3
+// client (runServe's other dependency) just to reach this code.
+func listenOnUnixSocket(socketPath string) (net.Listener, error) {
+	_ = os.Remove(socketPath) // defensive: clear a stale socket file, if any
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on %s: %w", socketPath, err)
+	}
+
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		listener.Close()
+		os.Remove(socketPath)
+		return nil, fmt.Errorf("failed to restrict socket permissions on %s: %w", socketPath, err)
+	}
+
+	return listener, nil
+}
+
 // runServe implements the daemon the Yarn plugin talks to: one S3 client
 // built once at startup, then any number of tarball fetches served over a
 // Unix socket, one connection per request. See docs/protocol.md.
@@ -92,11 +121,9 @@ Flags:
 		return exitConfiguration
 	}
 
-	_ = os.Remove(socketPath) // defensive: clear a stale socket file, if any
-
-	listener, err := net.Listen("unix", socketPath)
+	listener, err := listenOnUnixSocket(socketPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "yarnstatic serve: failed to listen on %s: %v\n", socketPath, err)
+		fmt.Fprintf(os.Stderr, "yarnstatic serve: %v\n", err)
 		return exitUsage
 	}
 	defer os.Remove(socketPath)

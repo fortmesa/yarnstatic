@@ -217,6 +217,31 @@ async function handleConn(socket, client, keyPrefix) {
   socket.end(body);
 }
 
+// Binds `server` to socketPath and restricts the resulting socket file to
+// 0600 before returning -- server.listen() alone creates the socket file
+// with permissions derived only from the process umask, which under a
+// permissive umask (0 or 002, common in root-run containers/some CI
+// images) would leave it group/world writable. This daemon has no
+// per-caller/per-project scoping by design (see docs/protocol.md's "Why
+// this shape"), so any other local process able to connect could request
+// any package@version (and arbitrary storageFolder) this daemon's own AWS
+// credentials can reach. 0600 restricts connections to the same OS user
+// that started the daemon, regardless of umask. Takes `server` as a
+// parameter (rather than constructing it itself) specifically so this
+// security property is directly unit-testable against a plain
+// net.createServer() instance, without needing a working S3 client
+// (runServe's other dependency) just to reach this code.
+async function listenOnUnixSocket(server, socketPath) {
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+  fs.chmodSync(socketPath, 0o600);
+}
+
 // runServe implements the daemon the Yarn plugin talks to: one S3 client
 // built once at startup, then any number of tarball fetches served over a
 // Unix socket, one connection per request. Ported from
@@ -345,15 +370,9 @@ async function runServe(args) {
   });
 
   try {
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socketPath, () => {
-        server.removeListener('error', reject);
-        resolve();
-      });
-    });
+    await listenOnUnixSocket(server, socketPath);
   } catch (err) {
-    process.stderr.write(`yarnstatic serve: failed to listen on ${socketPath}: ${err.message}\n`);
+    process.stderr.write(`yarnstatic serve: ${err.message}\n`);
     return config.exitUsage;
   }
 
@@ -372,4 +391,4 @@ async function runServe(args) {
   return exitCode;
 }
 
-module.exports = {runServe};
+module.exports = {runServe, listenOnUnixSocket};
