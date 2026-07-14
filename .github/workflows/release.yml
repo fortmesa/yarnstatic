@@ -445,4 +445,4 @@ jobs:
       - name: Publish to npmjs.dev.fort.blue
         if: steps.version-check.outputs.should-publish == 'true'
         working-directory: cli-node
-        run: yarn npm publish --access public
+        run: yarn npm publish --access public --provenance
