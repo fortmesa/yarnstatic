@@ -99,10 +99,12 @@ triggered by the same `v*.*.*` tag push as every other release artifact in
 this repo. Two jobs publish the same version. `publish-npm` sends it to
 `npmjs.dev.fort.blue`, which accepts the job's GitHub Actions OIDC token
 directly (same pattern as `verdaccio-security-filter`'s own release
-pipeline). `publish-npmjs` sends it to registry.npmjs.org from the `npmjs`
-GitHub environment, which the package's trusted-publisher entry on
-npmjs.com names, and `yarn npm publish` trades the job's OIDC token for a
-publish token. Neither job stores a token, and each skips cleanly if
+pipeline). `publish-npmjs` stages it on registry.npmjs.org from the
+`npmjs` GitHub environment, which the package's trusted-publisher entry on
+npmjs.com names, and `yarn npm publish --staged` trades the job's OIDC
+token for a token that can stage but not publish. The version goes live on
+npmjs.org once a maintainer approves the staged version on npmjs.com with
+2FA. Neither job stores a token, and each skips cleanly if
 `package.json`'s version is already on its registry. This package's
 version is independent of the repo's own git tags, the same as
 `yarn-plugin-yarnstatic-s3`'s, so bump it before tagging a release that

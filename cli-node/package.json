@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/yarnstatic",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Node.js CLI port of yarnstatic (check/fetch/serve/version) -- an alternative to the Go binary for environments with Node but not Go. Bundles yarn-plugin-yarnstatic-s3 for direct-S3 installs with no daemon.",
   "license": "MIT",
   "repository": {

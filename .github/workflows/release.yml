@@ -476,7 +476,10 @@ jobs:
     # The trusted publisher entry for @fortmesa/yarnstatic on npmjs.com
     # names this environment, so npm only honors an OIDC token from a job
     # running in it. The environment's v*.*.* tag rule limits which runs
-    # get one.
+    # get one. npm trusted publishers can only stage, not publish, so this
+    # job stages the version and a maintainer approves it on npmjs.com with
+    # 2FA. A direct publish gets 403 "OIDC permission denied for this
+    # action".
     environment: npmjs
     permissions:
       contents: read
@@ -528,7 +531,7 @@ jobs:
               echo "should-publish=false" >> "$GITHUB_OUTPUT"
               ;;
             404)
-              echo "@fortmesa/yarnstatic@$LOCAL_VERSION is not on npmjs.org yet -- will publish"
+              echo "@fortmesa/yarnstatic@$LOCAL_VERSION is not on npmjs.org yet -- will stage it"
               echo "should-publish=true" >> "$GITHUB_OUTPUT"
               ;;
             *)
@@ -537,7 +540,10 @@ jobs:
               ;;
           esac
 
-      - name: Publish to npmjs.org
+      # A staged version stays off the registry until it's approved, so the
+      # check above still answers 404 for it. Approve or reject a pending
+      # stage on npmjs.com before re-running this job.
+      - name: Stage on npmjs.org for approval
         if: steps.version-check.outputs.should-publish == 'true'
         working-directory: cli-node
-        run: yarn npm publish --access public --provenance
+        run: yarn npm publish --access public --provenance --staged
