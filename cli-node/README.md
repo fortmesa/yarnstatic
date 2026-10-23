@@ -48,10 +48,19 @@ end-to-end against the unmodified plugin. But if you only want the bundled
 `yarn-plugin-yarnstatic-s3` path, be aware the daemon plugin will pick this
 binary up automatically if both are present in the same project.
 
+The two Yarn plugins can't be loaded together. Both register
+`yarnstaticScopeStorage`, and Yarn then fails every command at startup
+with `Cannot redefine settings "yarnstaticScopeStorage"`. If the daemon
+plugin is installed machine-wide in `~/.yarnrc.yml`, don't import the
+bundled S3 plugin into a project on that machine.
+
 ## Commands
 
-- `yarnstatic check [flags] [path]` -- verify every `npm:`-protocol,
-  checksummed `yarn.lock` entry exists in the configured S3 bucket.
+- `yarnstatic check [flags] [path]` -- verify every `npm:`-protocol
+  `yarn.lock` entry exists in the configured S3 bucket. Entries without a
+  checksum are reported in a group of their own that doesn't affect the
+  exit code, and unset settings come from the same `.yarnrc.yml` files the
+  bundled S3 plugin reads.
 - `yarnstatic fetch [flags] --package <name>@<version> [--out file]` --
   one-shot manual/debug download.
 - `yarnstatic serve --socket <path> [flags]` -- the daemon

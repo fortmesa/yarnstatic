@@ -108,6 +108,14 @@ async function runFetch(args) {
     }
   }
 
+  // Records a failure writing the output (a file stream's close included),
+  // so it can be told apart from an S3 failure once the download rejects.
+  let writeErr = null;
+  const onWriteError = err => {
+    if (!writeErr) writeErr = err;
+  };
+  writable.on('error', onWriteError);
+
   // fetch is a standalone manual/debug tool with no project directory to
   // read a .yarnrc.yml from (unlike check/serve), so it doesn't support
   // per-scope storage-folder overrides -- see docs/s3-layout.md.
@@ -116,6 +124,12 @@ async function runFetch(args) {
   } catch (err) {
     if (out) {
       try { fs.unlinkSync(out); } catch { /* best-effort, matching Go's os.Remove */ }
+    }
+    if (writeErr) {
+      // A local write failure, not an S3 one -- see docs/cli.md's fetch
+      // exit codes.
+      process.stderr.write(`yarnstatic fetch: writing ${out || 'stdout'}: ${writeErr.message}\n`);
+      return config.exitUsage;
     }
     const key = err.s3Key;
     const kind = s3client.classify(err);
@@ -138,6 +152,8 @@ async function runFetch(args) {
         process.stderr.write(`yarnstatic fetch: failed to download s3://${bucket}/${key}: ${err.message}\n`);
     }
     return config.exitCodeForKind(kind);
+  } finally {
+    writable.removeListener('error', onWriteError);
   }
 
   return config.exitOK;

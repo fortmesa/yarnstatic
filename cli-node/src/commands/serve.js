@@ -231,15 +231,32 @@ async function handleConn(socket, client, keyPrefix) {
 // security property is directly unit-testable against a plain
 // net.createServer() instance, without needing a working S3 client
 // (runServe's other dependency) just to reach this code.
+//
+// The socket is also created under umask 0077: with only the chmod, a
+// permissive umask leaves it connectable between bind and chmod. listen()
+// binds synchronously, so the umask is the caller's again before any other
+// code runs.
 async function listenOnUnixSocket(server, socketPath) {
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(socketPath, () => {
-      server.removeListener('error', reject);
-      resolve();
-    });
+    const oldUmask = process.umask(0o077);
+    try {
+      server.listen(socketPath, () => {
+        server.removeListener('error', reject);
+        resolve();
+      });
+    } finally {
+      process.umask(oldUmask);
+    }
   });
-  fs.chmodSync(socketPath, 0o600);
+  try {
+    fs.chmodSync(socketPath, 0o600);
+  } catch (err) {
+    // Like serve.go, don't keep listening with umask-derived permissions.
+    await new Promise(resolve => server.close(() => resolve()));
+    try { fs.unlinkSync(socketPath); } catch { /* best-effort */ }
+    throw new Error(`failed to restrict socket permissions on ${socketPath}: ${err.message}`);
+  }
 }
 
 // runServe implements the daemon the Yarn plugin talks to: one S3 client
@@ -266,6 +283,11 @@ async function runServe(args) {
   const socketPath = parsed.values.socket;
   if (!socketPath) {
     process.stderr.write('yarnstatic serve: --socket is required\n');
+    return config.exitUsage;
+  }
+  const maxConcurrency = parsed.values['max-concurrency'];
+  if (maxConcurrency < 1) {
+    process.stderr.write('yarnstatic serve: --max-concurrency must be at least 1\n');
     return config.exitUsage;
   }
 
@@ -299,7 +321,6 @@ async function runServe(args) {
     }
   }
 
-  const maxConcurrency = parsed.values['max-concurrency'];
   let activeCount = 0;
   const waitQueue = [];
   function acquire() {
@@ -319,6 +340,7 @@ async function runServe(args) {
   }
 
   const inFlight = new Set();
+  const openSockets = new Set();
   let idleTimer = null;
   function resetIdleTimer() {
     if (idleTimer) clearTimeout(idleTimer);
@@ -346,18 +368,37 @@ async function runServe(args) {
     server.close();
 
     let timedOut = false;
+    let graceTimer;
     await Promise.race([
       Promise.all([...inFlight]),
-      new Promise(resolve => setTimeout(() => { timedOut = true; resolve(); }, SHUTDOWN_GRACE_MS)),
+      new Promise(resolve => {
+        graceTimer = setTimeout(() => { timedOut = true; resolve(); }, SHUTDOWN_GRACE_MS);
+      }),
     ]);
+    clearTimeout(graceTimer);
     if (timedOut) {
       process.stderr.write('yarnstatic serve: shutdown grace period elapsed, exiting with connections still in flight\n');
+      // Go's process exits here and takes these with it; in Node they would
+      // keep the event loop, and so the process, alive.
+      for (const s of openSockets) s.destroy();
     }
+    // Releases the SDK's pooled connections, which also aborts any S3
+    // request still in flight after the grace period.
+    client.s3.destroy();
     try { fs.unlinkSync(socketPath); } catch { /* best-effort */ }
     resolveExit(config.exitOK);
   }
 
-  const server = net.createServer(socket => {
+  // allowHalfOpen keeps the response writable after a client half-closes
+  // its side once the request is sent (ncat and socat do), as Go's server
+  // does; with Node's default the response would be dropped.
+  const server = net.createServer({allowHalfOpen: true}, socket => {
+    openSockets.add(socket);
+    socket.once('close', () => openSockets.delete(socket));
+    // readLine handles errors while the request is read; after that a
+    // write error just means the client went away, which Go ignores too.
+    // Without a listener it would crash the process.
+    socket.on('error', () => {});
     resetIdleTimer();
     const p = acquire()
       .then(() => handleConn(socket, client, keyPrefix))

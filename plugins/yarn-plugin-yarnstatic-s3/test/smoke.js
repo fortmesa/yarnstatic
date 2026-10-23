@@ -195,6 +195,43 @@ async function main() {
     );
   });
 
+  await check('parseTarballUrl: a registry with a path of its own, unscoped', () => {
+    assert.deepEqual(
+      parseTarballUrl('https://host.example/artifactory/api/npm/npm-remote/lodash/-/lodash-4.17.21.tgz'),
+      {scope: null, name: 'lodash', version: '4.17.21'},
+    );
+  });
+
+  await check('parseTarballUrl: a registry with a path of its own, scoped, %2f-encoded', () => {
+    assert.deepEqual(
+      parseTarballUrl('https://host.example/artifactory/api/npm/npm-remote/@babel%2fcore/-/core-7.20.0.tgz'),
+      {scope: 'babel', name: 'core', version: '7.20.0'},
+    );
+  });
+
+  await check('parseTarballUrl: a registry with a path of its own, scoped, unencoded slash', () => {
+    assert.deepEqual(
+      parseTarballUrl('https://host.example/registry/@babel/core/-/core-7.20.0.tgz'),
+      {scope: 'babel', name: 'core', version: '7.20.0'},
+    );
+  });
+
+  await check('parseTarballUrl: a registry path containing "/-/" splits at the last one', () => {
+    assert.deepEqual(
+      parseTarballUrl('https://host.example/-/mirror/lodash/-/lodash-4.17.21.tgz'),
+      {scope: null, name: 'lodash', version: '4.17.21'},
+    );
+  });
+
+  await check('parseTarballUrl: an empty ident or an empty scope returns null', () => {
+    assert.equal(parseTarballUrl('https://registry.example/-/lodash-4.17.21.tgz'), null);
+    assert.equal(parseTarballUrl('https://registry.example/@/core/-/core-7.20.0.tgz'), null);
+  });
+
+  await check('parseTarballUrl: bad percent-encoding returns null', () => {
+    assert.equal(parseTarballUrl('https://registry.example/lo%zzdash/-/lo%zzdash-1.0.0.tgz'), null);
+  });
+
   await check('parseTarballUrl: not a tarball URL at all (no /-/) returns null', () => {
     assert.equal(parseTarballUrl('https://registry.example/lodash'), null);
   });

@@ -55,15 +55,14 @@ cat > "$PROJECT/.yarnrc.yml" <<'EOF'
 enableGlobalCache: false
 EOF
 
-# Installed via `yarn plugin import`, the same mechanism install.sh uses
-# for a real project (yarn.lock present) - not a raw file copy. This is
-# also what forced sources/index.js's requires to live inside factory()
-# rather than at module top level: `plugin import` reads the plugin's
-# declared name by running it in a bare vm sandbox with no `require`
-# available, so a top-level require() throws during that step alone, even
-# though the plugin works fine once actually loaded for real.
+# `yarn plugin import` installs the bundle `yarn build` writes, the same
+# way install.sh installs the plugin in a Yarn project. A release ships
+# that bundle as plugin-yarnstatic.cjs.
+PLUGIN_DIR="$REPO_ROOT/plugins/yarn-plugin-yarnstatic"
+say "Building the plugin bundle in $PLUGIN_DIR..."
+( cd "$PLUGIN_DIR" && corepack yarn install --immutable && corepack yarn build )
 say "Installing the plugin via 'yarn plugin import'..."
-( cd "$PROJECT" && corepack yarn plugin import "$REPO_ROOT/plugins/yarn-plugin-yarnstatic/sources/index.js" )
+( cd "$PROJECT" && corepack yarn plugin import "$PLUGIN_DIR/bundles/@yarnpkg/plugin-yarnstatic.js" )
 
 run_with_timeout() {
   if command -v timeout >/dev/null 2>&1; then
@@ -102,11 +101,13 @@ if [ -d "$HOME/.aws" ]; then
 fi
 export HOME="$FAKE_HOME"
 
-# Snapshot pre-existing sockets first: /tmp is shared with whatever else is
-# on the box (including stale files from an earlier failed/killed run of
-# this very script), so the leftover-socket check below only flags sockets
-# newly created by *this* run, not unrelated pre-existing ones.
-BEFORE_SOCKS=$(ls /tmp/yarnstatic-*.sock 2>/dev/null || true)
+# The plugin makes one private socket directory per install under
+# os.tmpdir(), which is $TMPDIR or /tmp, and removes it on exit. Other
+# runs on the box can leave their own, a killed earlier run of this script
+# among them, so snapshot first and flag only directories this run created.
+SOCK_PARENT="${TMPDIR:-/tmp}"
+SOCK_PARENT="${SOCK_PARENT%/}"
+BEFORE_SOCKS=$(ls -d "$SOCK_PARENT"/yarnstatic-* 2>/dev/null || true)
 
 START=$(date +%s)
 if ! run_with_timeout corepack yarn install --immutable; then
@@ -119,11 +120,11 @@ ls "$PROJECT/.yarn/cache/lodash-npm-4.17.21-"*.zip >/dev/null 2>&1 \
   || die "expected .yarn/cache/lodash-npm-4.17.21-*.zip - install did not fetch through the daemon as expected"
 say "PASS: lodash fetched via the yarnstatic daemon from S3, install exited cleanly"
 
-AFTER_SOCKS=$(ls /tmp/yarnstatic-*.sock 2>/dev/null || true)
+AFTER_SOCKS=$(ls -d "$SOCK_PARENT"/yarnstatic-* 2>/dev/null || true)
 printf '%s\n' "$BEFORE_SOCKS" | sort > "$WORKDIR/before-socks"
 printf '%s\n' "$AFTER_SOCKS" | sort > "$WORKDIR/after-socks"
 NEW_SOCKS=$(comm -13 "$WORKDIR/before-socks" "$WORKDIR/after-socks")
 if [ -n "$NEW_SOCKS" ]; then
-  die "leftover daemon socket(s) created by this run - daemon did not shut down cleanly: $NEW_SOCKS"
+  die "leftover daemon socket dir(s) created by this run - the plugin did not clean up on exit: $NEW_SOCKS"
 fi
-say "PASS: no leftover daemon socket"
+say "PASS: no leftover daemon socket dir"

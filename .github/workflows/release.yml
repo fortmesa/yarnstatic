@@ -20,9 +20,12 @@ jobs:
   # node_modules (yarn install --immutable, which is also the one place a
   # compromised transitive dependency's postinstall script, the
   # "Shai-Hulud" class of supply-chain attack, could execute). Every job
-  # after this one restores from cache instead of re-fetching, so none of
-  # them ever touch the live Go proxy or npm registry, and none of them run
-  # a dependency's install-time lifecycle script.
+  # after this one restores dependencies from cache, so none of them fetch
+  # a module or package from the Go proxy or npm registry, and none of them
+  # run a dependency's install-time lifecycle script. They do still
+  # download tools. setup-go fetches the Go toolchain when the runner image
+  # lacks that version, and corepack fetches yarn itself, which the hash
+  # in each package.json's packageManager field pins.
   install:
     name: Install
     runs-on: ubuntu-slim
@@ -91,10 +94,11 @@ jobs:
             cli-node/.yarn/install-state.gz
           key: node-modules-cli-node-${{ github.sha }}
 
-  # No network access: restores everything install already fetched, and
-  # GOPROXY=off/GOFLAGS=-mod=readonly turn any gap in the Go module cache
-  # into a loud failure instead of a silent live fetch (fail-on-cache-miss:
-  # true does the same job for the two node_modules restores below).
+  # Fetches no dependencies: restores everything install already fetched,
+  # and GOPROXY=off/GOFLAGS=-mod=readonly turn any gap in the Go module
+  # cache into a loud failure instead of a silent live fetch
+  # (fail-on-cache-miss: true does the same job for the node_modules
+  # restores below). setup-go can still download the Go toolchain itself.
   test:
     name: Test
     needs: install
@@ -208,9 +212,10 @@ jobs:
           fail-on-cache-miss: true
 
       # -X main.version=... matches the exact tag this release is published
-      # under (same github.ref_name the `release` job's softprops/action-gh-release
-      # step defaults to) -- so `yarnstatic version` and the release it came
-      # from can never drift apart.
+      # under (the same tag the `release` job publishes the GitHub release
+      # under) -- so `yarnstatic version` and the release it came from can
+      # never drift apart. The tag is read from GITHUB_REF_NAME rather than
+      # substituted into the script, so a tag name can't inject shell.
       - name: Build yarnstatic
         env:
           GOOS: ${{ matrix.goos }}
@@ -219,8 +224,8 @@ jobs:
         run: |
           set -eu
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
-            -o "dist/yarnstatic-${{ matrix.goos }}-${{ matrix.goarch }}" \
+          go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" \
+            -o "dist/yarnstatic-$GOOS-$GOARCH" \
             ./cmd/yarnstatic
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
@@ -307,11 +312,26 @@ jobs:
           if-no-files-found: error
 
       - name: Create release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b   # v3
-        with:
-          files: dist/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # Replaces the action's fail_on_unmatched_files. With no match, bash
+          # passes the literal string dist/* to gh and the upload fails late.
+          ls dist/* >/dev/null
+          # A re-run finds the release its first attempt made and replaces
+          # the assets on it, rather than failing on create and skipping
+          # release-s3. --verify-tag fails if the tag is gone, where gh would
+          # otherwise create it at the default branch, a different commit
+          # from the one built.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes
+          fi
 
   release-s3:
     name: Publish to S3
@@ -349,7 +369,7 @@ jobs:
       # a re-run of this tag is idempotent (PutObject overwrite) without
       # touching any other version's prefix.
       - name: Publish to S3
-        run: aws s3 cp dist/ "s3://fmdev-npmjs-storage/fortmesa/yarnstatic/${{ github.ref_name }}/" --recursive
+        run: aws s3 cp dist/ "s3://fmdev-npmjs-storage/fortmesa/yarnstatic/$GITHUB_REF_NAME/" --recursive
 
   publish-npm:
     name: Publish @fortmesa/yarnstatic to npm

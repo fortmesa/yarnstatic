@@ -23,32 +23,19 @@
  * as the daemon-based plugin (or the yarnstaticBucket .yarnrc.yml setting,
  * see below) -- leave both unset and this plugin is a complete no-op.
  *
- * Unlike ../yarn-plugin-yarnstatic (a raw, unbundled file loaded directly
- * via `yarn plugin import`, which is why THAT file has to hand-author its
- * own `module.exports = {name, factory: (require) => {...}}` wrapper and
- * do everything inside it -- see that file's own header comment), this
- * plugin is built via @yarnpkg/builder (`yarn build`, see package.json).
- * The builder's own bundler supplies that exact wrapper itself, around
- * whatever this file exports -- confirmed directly: authoring a second,
- * redundant factory/require wrapper IN this file (matching the unbundled
- * plugin's own style) breaks it in a way that's easy to miss, because it
- * still builds without error. The `require` identifier that wrapper
- * introduces shadows the real one for everything nested inside it, so
- * esbuild can't tell any of those require(...) calls apart from a call to
- * some arbitrary same-named local variable -- it leaves every one of them
- * as a literal, unresolved call instead of bundling what they ask for, and
- * the doubly-wrapped return value ends up being this file's OWN
- * {name, factory} object instead of the actual {default: {...}} hooks
- * payload Yarn expects back from calling the (builder-supplied) outer
- * factory. Both failures are silent at build time; the bundle size (a
- * suspiciously tiny few KB when it should hold the whole aws-sdk client)
- * is the tell. Plain top-level `require(...)` calls in this file, with no
- * wrapper of its own, are what the builder actually expects -- exactly
- * the shape ../../verdaccio-generic-oidc's own yarn-plugin-oidc-login
- * (also built via @yarnpkg/builder) uses, just CommonJS `require`/
- * `module.exports` here instead of that one's TypeScript `import`/
- * `export default`, to stay consistent with the daemon-based plugin's own
- * plain-JS style in this repo.
+ * `yarn build` bundles this plugin with @yarnpkg/builder, the same as
+ * ../yarn-plugin-yarnstatic, and the builder wraps whatever this file
+ * exports in `{name, factory: (require) => {...}}`. A second wrapper
+ * written in this file breaks the plugin, and the build still succeeds.
+ * The `require` it introduces shadows the real one for everything inside
+ * it, so esbuild leaves each require(...) call unresolved instead of
+ * bundling it, and the factory returns this file's own {name, factory}
+ * object instead of the {default: {...}} hooks payload Yarn expects. The
+ * tell is the bundle size, a few KB when it should hold the whole aws-sdk
+ * client. The builder expects plain top-level `require(...)` calls with
+ * no wrapper. ../../verdaccio-generic-oidc's yarn-plugin-oidc-login has
+ * the same shape in TypeScript; this file uses CommonJS to match the
+ * daemon-based plugin.
  */
 'use strict';
 
@@ -131,9 +118,13 @@ function tarballKey(prefix, spec, storageFolder) {
  *   {registry}/{identUrl}/-/{basename}-{version}.tgz
  * where identUrl is "/name" or "/@scope%2fname" (NpmSemverFetcher retries
  * with an unencoded "/@scope/name" on a first-attempt failure, so both
- * forms are accepted here). Returns {scope, name, version} (scope is null
- * for an unscoped package), or null if target isn't a recognized npm
- * tarball URL.
+ * forms are accepted here). The registry URL can carry a path of its own
+ * (Artifactory, Nexus, a path-mounted Verdaccio), so the ident is read from
+ * the last one or two path segments before the final "/-/" and anything
+ * ahead of it is ignored. A registry path whose last segment starts with
+ * "@" reads as a scope, since it looks the same as the unencoded form.
+ * Returns {scope, name, version} (scope is null for an unscoped package),
+ * or null if target isn't a recognized npm tarball URL.
  */
 function parseTarballUrl(target) {
   let url;
@@ -143,10 +134,13 @@ function parseTarballUrl(target) {
     return null;
   }
 
-  const sepIndex = url.pathname.indexOf('/-/');
+  const sepIndex = url.pathname.lastIndexOf('/-/');
   if (sepIndex < 0) return null;
 
-  const identSegment = url.pathname.slice(1, sepIndex);
+  const segments = url.pathname.slice(0, sepIndex).split('/');
+  const last = segments[segments.length - 1];
+  const prev = segments.length > 2 ? segments[segments.length - 2] : '';
+  const identSegment = !last.startsWith('@') && prev.startsWith('@') ? `${prev}/${last}` : last;
   const basename = url.pathname.slice(sepIndex + 3);
   if (identSegment === '' || !basename.endsWith('.tgz') || basename.includes('/')) {
     return null;
@@ -166,6 +160,7 @@ function parseTarballUrl(target) {
     if (slash < 0) return null;
     scope = ident.slice(1, slash);
     name = ident.slice(slash + 1);
+    if (!scope || !name) return null;
   } else if (ident.includes('/')) {
     return null;
   }

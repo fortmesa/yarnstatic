@@ -7,6 +7,13 @@ lives in Go, reached via a subprocess). For install/wiring instructions see
 [the plugin's own README](../plugins/yarn-plugin-yarnstatic/README.md);
 this document explains how it's built and why.
 
+`yarn build` bundles it into `bundles/@yarnpkg/plugin-yarnstatic.js` with
+`@yarnpkg/builder`, and releases ship that bundle as
+`plugin-yarnstatic.cjs`. Import the bundle. `yarn plugin import` reads a
+plugin's name by running it in a sandbox with no `require`, so the
+top-level `require` calls in `sources/index.js` make the raw source fail
+to import.
+
 ## Enablement: environment variable presence, not `.yarnrc.yml` config
 
 The plugin's `wrapNetworkRequest` hook checks `process.env.YARNSTATIC_BUCKET`
@@ -35,7 +42,11 @@ When enabled, `wrapNetworkRequest`:
    [protocol.md](protocol.md)'s neighbor, the URL-side parsing logic lives
    here since it's Yarn-specific, not part of the S3 wire protocol). On a
    match, it fetches the package via the daemon (below) and resolves
-   `{body, statusCode: 200, headers: {}}`.
+   `{body, statusCode: 200, headers: {}}`. The registry URL may carry a
+   path of its own, as Artifactory, Nexus and a path-mounted Verdaccio
+   do. The package name comes from the one or two path segments right
+   before the last `/-/`, so a registry path whose last segment starts
+   with `@` would read as a scope.
 2. On **no match**, it throws immediately rather than falling through to
    the real executor.
 
@@ -47,9 +58,11 @@ fail - or worse, silently defeat the purpose of the guarantee - in the
 actually-offline environment this is meant for.
 
 **Caveat**: `wrapNetworkRequest` only wraps requests that flow through
-Yarn core's own `httpUtils.request()`. It does not intercept a fetcher that
-shells out to an external binary directly - notably `git`/`github`/`exec`
-protocol dependencies, which may invoke the system `git` binary instead.
+Yarn core's own `httpUtils.request()`. Git dependencies get past it. For a
+GitHub repository, Yarn's GitHub plugin first tries a tarball download
+through `httpUtils`, which this plugin blocks, but it catches that error
+and gives up quietly, and Yarn then runs `git clone` itself. Other git
+hosts go straight to `git clone`, and `exec:` dependencies run a script.
 `yarnstatic check` warns explicitly if any of these are found in a
 project's `yarn.lock` (see [cli.md](cli.md)), since their presence means
 this guarantee has a gap for that project.
@@ -77,12 +90,19 @@ and the protocol field below). In `wrapNetworkRequest`, once a request's
 target resolves to a package spec, the plugin looks up that package's scope
 in this map and - only if present - includes it as `storageFolder` in the
 request sent to the daemon (see [protocol.md](protocol.md)). There's no Go
-CLI flag or `YARNSTATIC_*` env var for this: `.yarnrc.yml` is the only
-place it lives, so the plugin and `yarnstatic check` (which reads the same
-key straight out of `<path>/.yarnrc.yml` - see [cli.md](cli.md)) can't drift
-out of sync with each other. `yarnstatic fetch` doesn't support it - it has
-no project directory to read a `.yarnrc.yml` from at all, being a
+CLI flag or `YARNSTATIC_*` env var for this. `.yarnrc.yml` is the only
+place it lives, and `yarnstatic check` reads it from the same files Yarn
+loads and merges them the same way, so the plugin and `check` compute the
+same keys (see [cli.md](cli.md)). `yarnstatic fetch` doesn't support it -
+it has no project directory to read a `.yarnrc.yml` from at all, being a
 standalone single-package debug tool.
+
+`yarn-plugin-yarnstatic-s3` registers `yarnstaticScopeStorage` as well,
+and Yarn refuses to load two plugins that register the same setting.
+With both loaded, every `yarn` command fails at startup with `Cannot
+redefine settings "yarnstaticScopeStorage"`, and that includes this plugin
+in `~/.yarnrc.yml` with the S3 plugin in a project's `.yarnrc.yml`. Use
+one plugin or the other.
 
 Deliberately *not* passed to `yarnstatic serve` at spawn time (as an env
 var or flag): whether a package needs this override is resolved by the
@@ -97,8 +117,11 @@ one consumer at once (see [protocol.md](protocol.md)'s "why this shape").
 `resolveBinary()` checks, in order:
 
 1. `YARNSTATIC_BIN` env var - explicit override, always wins.
-2. `<projectRoot>/node_modules/.bin/yarnstatic` - in case it's ever
-   vendored as a local devDependency.
+2. `<projectRoot>/node_modules/.bin/yarnstatic`, but only when it
+   resolves into `node_modules/@fortmesa/yarnstatic`. Any dependency can
+   declare a `yarnstatic` bin, and the plugin would run it with the
+   install's AWS environment even under `enableScripts: false`, so a bin
+   from any other package is skipped.
 3. `$GOBIN/yarnstatic`, else `$GOPATH/bin/yarnstatic`, else
    `~/go/bin/yarnstatic` - the standard `go install` output location,
    which often isn't on `PATH` on a fresh machine.
@@ -150,11 +173,13 @@ mechanism the whole lifecycle rests on:
   parallel) to both observe `daemonPromise === null` - the first caller
   sets it before yielding control, so every other concurrent caller just
   awaits the same in-flight promise.
-- **Socket path continuity.** `startDaemon()` generates the socket path
-  once (`path.join(os.tmpdir(), \`yarnstatic-${process.pid}.sock\`)`) and
-  resolves `daemonPromise` to `{socketPath, child}`. Every later call
-  destructures the same object - the path isn't rediscovered per-request,
-  it's held in memory for the process's lifetime.
+- **Socket path continuity.** `startDaemon()` creates a private directory
+  once, `fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-'))`, which is
+  mode 0700 under a random name, and puts the socket at `daemon.sock`
+  inside it. No other user can create that path first or connect to the
+  socket. It resolves `daemonPromise` to `{socketPath, child}`. Every later
+  call destructures the same object - the path isn't rediscovered
+  per-request, it's held in memory for the process's lifetime.
 - **Startup.** `startDaemon()` spawns `yarnstatic serve --socket
   <socketPath>` (bucket/prefix/region/etc. need no explicit passing - the
   daemon inherits and reads the same `YARNSTATIC_*` env vars itself), then
@@ -169,7 +194,10 @@ mechanism the whole lifecycle rests on:
   protocol.md's "Why this shape"). The probe doesn't send a request, so
   it doesn't need the negotiated version `checkGreeting()` returns - each
   real fetch (`fetchFromDaemon`) negotiates its own on its own
-  connection.
+  connection. The 10s deadline covers the whole wait, reading the greeting
+  included, so a listener that accepts and never answers fails the start
+  instead of hanging the install. A connection that closes before a full
+  greeting line counts as not ready yet and is retried.
 - **`child.unref()` / `child.stderr.unref()`, called right after spawn.**
   Without these, the running daemon - and its still-open `stderr` pipe -
   keeps this process's event loop non-empty indefinitely, since Node
@@ -187,7 +215,8 @@ mechanism the whole lifecycle rests on:
   {} })`. Node's `exit` event fires synchronously just before the process
   terminates, for both normal completion and errors - that's what tells
   the daemon to stop. It receives `SIGTERM` and runs its own
-  graceful-shutdown path (see [cli.md](cli.md)'s `serve` section). This
+  graceful-shutdown path (see [cli.md](cli.md)'s `serve` section). The same
+  handler then removes the socket directory. This
   deliberately scopes one daemon to one `yarn install` invocation, not a
   persistent multi-consumer service - that would need its own coordination
   (well-known socket path, "is one already running" races, config drift)
@@ -198,23 +227,25 @@ mechanism the whole lifecycle rests on:
   shutdown path, not a `kill -9`/OOM-kill, which would skip it entirely and
   leak the daemon. `yarnstatic serve`'s own idle-timeout (5 minutes,
   hardcoded - see [cli.md](cli.md)) is the defense-in-depth for that case,
-  not this plugin's responsibility.
+  not this plugin's responsibility. The daemon removes its socket file
+  when it exits, but the empty `yarnstatic-*` directory stays in the temp
+  directory after a hard kill.
 
 ## Verification notes
 
-The full plugin - `wrapNetworkRequest`'s real hook shape (`extra.target`,
-the resolved `{body, statusCode, headers}`), `parseTarballUrl`,
-`resolveBinary`, the daemon-singleton lifecycle (including the
-`unref()`/exit-handler shutdown path), and `fetchFromDaemon`'s full
-greeting-then-request-then-response exchange - has been exercised live,
-repeatedly, via `scripts/e2e-test.sh`: a real Yarn Berry 4.17.0 project,
-the actual plugin file, a real `yarnstatic serve` daemon, against the real
-`your-s3-bucket` S3 bucket, with the global cache disabled and
-`.yarn/cache` cleared each run to force a genuine fetch. This covers the
-JSON protocol (not the old plain-text format), the greeting/version
-negotiation handshake, and the no-`storageFolder` path end-to-end -
-`parseTarballUrl` is additionally covered by its own unit-test-style
-isolated checks (scoped, unscoped, and hyphenated package names).
+`scripts/e2e-test.sh` exercises the full plugin live: `wrapNetworkRequest`'s
+real hook shape (`extra.target`, the resolved `{body, statusCode,
+headers}`), `parseTarballUrl`, `resolveBinary`, the daemon-singleton
+lifecycle (including the `unref()`/exit-handler shutdown path), and
+`fetchFromDaemon`'s full greeting-then-request-then-response exchange. It
+runs a real Yarn Berry 4.17.0 project with the built plugin bundle and a
+real `yarnstatic serve` daemon against the real `your-s3-bucket` S3
+bucket, with the global cache disabled and `.yarn/cache` cleared each run
+to force a genuine fetch. That covers the JSON protocol, the
+greeting/version negotiation handshake, and the no-`storageFolder` path
+end-to-end. `parseTarballUrl` also has its own isolated checks in
+`test/smoke.js`, covering scoped, unscoped and hyphenated package names
+and registries with a path.
 
 **What's genuinely still open**:
 1. `yarnstaticScopeStorage` / `storageFolder` has only been exercised with

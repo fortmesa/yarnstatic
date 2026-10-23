@@ -1,8 +1,31 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+// isolateEnv clears every YARNSTATIC_*, YARN_YARNSTATIC_* and
+// YARN_RC_FILENAME variable and points HOME at an empty directory, for the
+// length of the test. A shell that exported YARNSTATIC_BUCKET (the README's
+// quick start does) would otherwise turn a "missing bucket" case into a
+// real S3 request, and ~/.yarnrc.yml would leak into check.
+func isolateEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		upper := strings.ToUpper(k)
+		if strings.HasPrefix(upper, "YARNSTATIC_") || strings.HasPrefix(upper, "YARN_YARNSTATIC_") || upper == "YARN_RC_FILENAME" {
+			t.Setenv(k, "") // registers the restore
+			os.Unsetenv(k)
+		}
+	}
+	t.Setenv("HOME", t.TempDir())
+}
 
 func TestRunDispatch(t *testing.T) {
+	isolateEnv(t)
 	cases := []struct {
 		name string
 		args []string
@@ -20,6 +43,8 @@ func TestRunDispatch(t *testing.T) {
 		{"fetch missing bucket", []string{"fetch", "--package", "lodash@4.17.21"}, exitConfiguration},
 		{"serve missing socket is a usage error (checked before --bucket)", []string{"serve", "--bucket", "b"}, exitUsage},
 		{"serve missing bucket", []string{"serve", "--socket", "/tmp/does-not-matter.sock"}, exitConfiguration},
+		{"serve zero max-concurrency", []string{"serve", "--socket", "/tmp/does-not-matter.sock", "--max-concurrency", "0"}, exitUsage},
+		{"serve negative max-concurrency", []string{"serve", "--socket", "/tmp/does-not-matter.sock", "--max-concurrency", "-1"}, exitUsage},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

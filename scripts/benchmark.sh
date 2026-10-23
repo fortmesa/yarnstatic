@@ -94,7 +94,16 @@ fi
 RESULTS_FILE=$(mktemp)
 WORKDIRS=()
 
+# Output of the timed command. mktemp keeps it out of a fixed,
+# world-readable path in shared /tmp. The file stays after a failed run so
+# the path in the error message still exists.
+LOG_FILE=$(mktemp)
+
 cleanup() {
+  local status=$?
+  if [ "$status" -eq 0 ]; then
+    rm -f "$LOG_FILE"
+  fi
   if [ "${BENCHMARK_KEEP_WORKDIRS:-}" = "1" ]; then
     echo "BENCHMARK_KEEP_WORKDIRS=1 set -- leaving ${#WORKDIRS[@]} workdir(s) in place"
   else
@@ -140,12 +149,12 @@ setup_project() {
 time_it() {
   local start end
   start=$(date +%s.%N)
-  "$@" > /tmp/benchmark-last-run.log 2>&1
+  "$@" > "$LOG_FILE" 2>&1
   local status=$?
   end=$(date +%s.%N)
   if [ "$status" -ne 0 ]; then
-    echo "benchmark: command failed (see /tmp/benchmark-last-run.log): $*" >&2
-    tail -40 /tmp/benchmark-last-run.log >&2
+    echo "benchmark: command failed (see $LOG_FILE): $*" >&2
+    tail -40 "$LOG_FILE" >&2
     return 1
   fi
   awk "BEGIN {printf \"%.2f\", $end - $start}"

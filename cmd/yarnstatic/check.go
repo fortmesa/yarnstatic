@@ -19,11 +19,6 @@ import (
 
 const checkConcurrency = 16
 
-// networkBypassProtocols bypass the plugin's wrapNetworkRequest block
-// entirely (they don't fetch tarballs over httpUtils), so they deserve a
-// louder warning than the routine workspace:/portal:/link: skip summary.
-var networkBypassProtocols = []string{"git", "github", "exec"}
-
 func runCheck(args []string) int {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	var common commonFlags
@@ -34,7 +29,14 @@ func runCheck(args []string) int {
 Parses <path>/yarn.lock (path defaults to the current directory) and
 verifies that every npm-protocol, checksummed package it references exists
 in the configured S3 bucket. Exits non-zero if anything is missing or
-errored, listing every problem - not just the first.
+errored, listing every problem - not just the first. npm entries without a
+checksum (platform-specific packages) are checked too and reported
+separately, without affecting the exit code.
+
+Settings left unset by flags and YARNSTATIC_* env vars are read from the
+same .yarnrc.yml files Yarn loads for <path> (yarnstaticBucket,
+yarnstaticKeyPrefix, yarnstaticRegion, yarnstaticEndpoint,
+yarnstaticProfile, yarnstaticScopeStorage).
 
 Flags:
 `)
@@ -54,9 +56,15 @@ Flags:
 		return exitUsage
 	}
 
-	// requireBucket (inside resolve) is the "missing bucket name" case the
-	// exitConfiguration code exists for - see config.go.
-	bucket, keyPrefix, s3opts, err := common.resolve()
+	rc, err := loadYarnrc(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "yarnstatic check: %v\n", err)
+		return exitUsage
+	}
+
+	// requireBucket (inside resolveWith) is the "missing bucket name" case
+	// the exitConfiguration code exists for - see config.go.
+	bucket, keyPrefix, s3opts, err := common.resolveWith(rc)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "yarnstatic check: %v\n", err)
 		return exitConfiguration
@@ -69,16 +77,10 @@ Flags:
 		return exitUsage
 	}
 
-	scopeStorage, err := loadScopeStorage(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "yarnstatic check: %v\n", err)
-		return exitUsage
-	}
-
 	printSkipSummary(os.Stdout, result)
 
-	if len(result.Entries) == 0 {
-		fmt.Println("no npm packages with checksums found to verify")
+	if len(result.Entries) == 0 && len(result.NoChecksum) == 0 {
+		fmt.Println("no npm packages found to verify")
 		return exitOK
 	}
 
@@ -94,46 +96,33 @@ Flags:
 
 	fmt.Printf("Checking s3://%s/%s ...\n\n", bucket, keyPrefix)
 
-	type outcome struct {
-		entry  lockfile.Entry
-		key    string
-		exists bool
-		err    error
-	}
-	results := make([]outcome, len(result.Entries))
+	// Both groups share one errgroup, so the concurrency limit covers all
+	// HEAD requests in flight.
+	all := append(append([]lockfile.Entry{}, result.Entries...), result.NoChecksum...)
+	allResults := make([]checkOutcome, len(all))
 
 	var g errgroup.Group
 	g.SetLimit(checkConcurrency)
-	for i, entry := range result.Entries {
+	for i, entry := range all {
 		i, entry := i, entry
 		g.Go(func() error {
 			key := verdaccio.TarballKey(keyPrefix, verdaccio.PackageSpec{
 				Scope: entry.Scope, Name: entry.Name, Version: entry.Version,
-			}, scopeStorage[entry.Scope])
+			}, rc.ScopeStorage[entry.Scope])
 			exists, err := client.Exists(ctx, key)
 			// Never propagate the error through the group - that would
 			// fail-fast cancel siblings, but the whole point is reporting
 			// every missing/errored object, not just the first.
-			results[i] = outcome{entry: entry, key: key, exists: exists, err: err}
+			allResults[i] = checkOutcome{entry: entry, key: key, exists: exists, err: err}
 			return nil
 		})
 	}
 	_ = g.Wait()
 
-	var missing, errored []outcome
-	present := 0
-	kindCounts := map[s3client.ErrorKind]int{}
-	for _, r := range results {
-		switch {
-		case r.err != nil:
-			errored = append(errored, r)
-			kindCounts[s3client.Classify(r.err)]++
-		case r.exists:
-			present++
-		default:
-			missing = append(missing, r)
-		}
-	}
+	results := allResults[:len(result.Entries)]
+	noChecksumResults := allResults[len(result.Entries):]
+
+	present, missing, errored, kindCounts := tallyOutcomes(results)
 
 	if len(missing) > 0 {
 		fmt.Printf("MISSING (%d):\n", len(missing))
@@ -153,9 +142,29 @@ Flags:
 		fmt.Println()
 	}
 
+	ncPresent, ncMissing, ncErrored, _ := tallyOutcomes(noChecksumResults)
+	if len(ncMissing) > 0 {
+		fmt.Printf("MISSING, NO CHECKSUM (%d) - not counted in the exit code:\n", len(ncMissing))
+		for _, r := range ncMissing {
+			fmt.Printf("  %-30s s3://%s/%s%s\n", r.entry.Descriptor, bucket, r.key, conditionsSuffix(r.entry))
+		}
+		fmt.Println()
+	}
+	if len(ncErrored) > 0 {
+		fmt.Printf("ERRORS, NO CHECKSUM (%d) - not counted in the exit code:\n", len(ncErrored))
+		for _, r := range ncErrored {
+			fmt.Printf("  %-30s [%s] %v%s\n", r.entry.Descriptor, s3client.Classify(r.err), r.err, conditionsSuffix(r.entry))
+		}
+		fmt.Println()
+	}
+
 	fmt.Printf("Summary: %d present, %d missing, %d error (out of %d checked)\n", present, len(missing), len(errored), len(results))
 	if len(errored) > 0 {
 		fmt.Printf("  errors by kind: %s\n", formatKindCounts(kindCounts))
+	}
+	if len(noChecksumResults) > 0 {
+		fmt.Printf("No checksum: %d present, %d missing, %d error (out of %d checked, not counted in the exit code)\n",
+			ncPresent, len(ncMissing), len(ncErrored), len(noChecksumResults))
 	}
 
 	// Priority order, most to least fundamental: a misconfigured
@@ -179,6 +188,37 @@ Flags:
 	return exitOK
 }
 
+type checkOutcome struct {
+	entry  lockfile.Entry
+	key    string
+	exists bool
+	err    error
+}
+
+func tallyOutcomes(results []checkOutcome) (present int, missing, errored []checkOutcome, kindCounts map[s3client.ErrorKind]int) {
+	kindCounts = map[s3client.ErrorKind]int{}
+	for _, r := range results {
+		switch {
+		case r.err != nil:
+			errored = append(errored, r)
+			kindCounts[s3client.Classify(r.err)]++
+		case r.exists:
+			present++
+		default:
+			missing = append(missing, r)
+		}
+	}
+	return present, missing, errored, kindCounts
+}
+
+// conditionsSuffix shows which platforms a no-checksum entry is for.
+func conditionsSuffix(e lockfile.Entry) string {
+	if e.Conditions == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (%s)", e.Conditions)
+}
+
 // formatKindCounts renders a fixed, priority order (matching the exit-code
 // priority above) rather than map iteration order, so the summary line is
 // deterministic across runs.
@@ -199,27 +239,57 @@ func formatKindCounts(counts map[s3client.ErrorKind]int) string {
 }
 
 func printSkipSummary(w io.Writer, result *lockfile.Result) {
+	packages := fmt.Sprintf("%d npm package(s) with checksums, %d without", len(result.Entries), len(result.NoChecksum))
+
 	counts := result.SkippedCounts()
 	if len(counts) == 0 {
-		fmt.Fprintf(w, "yarn.lock: %d npm package(s) with checksums (no entries skipped)\n", len(result.Entries))
-		return
+		fmt.Fprintf(w, "yarn.lock: %s (no entries skipped)\n", packages)
+	} else {
+		protos := make([]string, 0, len(counts))
+		for p := range counts {
+			protos = append(protos, string(p))
+		}
+		sort.Strings(protos)
+
+		parts := make([]string, 0, len(protos))
+		for _, p := range protos {
+			parts = append(parts, fmt.Sprintf("%d %s:", counts[lockfile.Protocol(p)], p))
+		}
+		fmt.Fprintf(w, "yarn.lock: %s (skipped: %s)\n", packages, strings.Join(parts, ", "))
 	}
 
-	protos := make([]string, 0, len(counts))
-	for p := range counts {
-		protos = append(protos, string(p))
+	// Git and exec: entries never reach the network hook the plugins wrap
+	// (Yarn clones git dependencies with git itself, and runs exec: scripts),
+	// so they deserve a louder warning than the routine skip summary. An
+	// npm entry whose __archiveUrl the plugins can't parse is blocked at
+	// install time.
+	var git, exec, archive []lockfile.Skipped
+	for _, s := range result.Skipped {
+		switch {
+		case s.Reason == lockfile.SkipArchiveURL:
+			archive = append(archive, s)
+		case lockfile.IsGitReference(s.Reference):
+			git = append(git, s)
+		case s.Protocol == "exec":
+			exec = append(exec, s)
+		}
 	}
-	sort.Strings(protos)
-
-	parts := make([]string, 0, len(protos))
-	for _, p := range protos {
-		parts = append(parts, fmt.Sprintf("%d %s:", counts[lockfile.Protocol(p)], p))
+	if len(git) > 0 {
+		fmt.Fprintf(w, "WARNING: %d entries resolve from git repositories, which Yarn clones with git outside the yarnstatic plugin's network block - they need real network access during install:\n", len(git))
+		for _, s := range git {
+			fmt.Fprintf(w, "  %s\n", s.Descriptor)
+		}
 	}
-	fmt.Fprintf(w, "yarn.lock: %d npm package(s) with checksums (skipped: %s)\n", len(result.Entries), strings.Join(parts, ", "))
-
-	for _, p := range networkBypassProtocols {
-		if n := counts[lockfile.Protocol(p)]; n > 0 {
-			fmt.Fprintf(w, "WARNING: %d entries resolve via the %q protocol, which the yarnstatic plugin's network block does not cover - they may still require real network access during install\n", n, p)
+	if len(exec) > 0 {
+		fmt.Fprintf(w, "WARNING: %d entries resolve via the \"exec\" protocol, which the yarnstatic plugin's network block does not cover - they may still require real network access during install:\n", len(exec))
+		for _, s := range exec {
+			fmt.Fprintf(w, "  %s\n", s.Descriptor)
+		}
+	}
+	if len(archive) > 0 {
+		fmt.Fprintf(w, "WARNING: %d npm entries carry an __archiveUrl that isn't an npm tarball URL, so the yarnstatic plugin blocks the fetch during install:\n", len(archive))
+		for _, s := range archive {
+			fmt.Fprintf(w, "  %s %s\n", s.Descriptor, s.Reference)
 		}
 	}
 }

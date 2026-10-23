@@ -27,6 +27,8 @@ const {
   parseVersion,
   compareVersions,
   checkGreeting,
+  resolveBinary,
+  startDaemon,
   parseTarballUrl,
   scopeOf,
   splitPackageSpec,
@@ -113,6 +115,43 @@ async function main() {
       parseTarballUrl('https://registry.example/@babel/core/-/core-7.20.0.tgz'),
       '@babel/core@7.20.0',
     );
+  });
+
+  await check('parseTarballUrl: a registry with a path of its own, unscoped', () => {
+    assert.equal(
+      parseTarballUrl('https://host.example/artifactory/api/npm/npm-remote/lodash/-/lodash-4.17.21.tgz'),
+      'lodash@4.17.21',
+    );
+  });
+
+  await check('parseTarballUrl: a registry with a path of its own, scoped, %2f-encoded', () => {
+    assert.equal(
+      parseTarballUrl('https://host.example/artifactory/api/npm/npm-remote/@babel%2fcore/-/core-7.20.0.tgz'),
+      '@babel/core@7.20.0',
+    );
+  });
+
+  await check('parseTarballUrl: a registry with a path of its own, scoped, unencoded slash', () => {
+    assert.equal(
+      parseTarballUrl('https://host.example/registry/@babel/core/-/core-7.20.0.tgz'),
+      '@babel/core@7.20.0',
+    );
+  });
+
+  await check('parseTarballUrl: a registry path containing "/-/" splits at the last one', () => {
+    assert.equal(
+      parseTarballUrl('https://host.example/-/mirror/lodash/-/lodash-4.17.21.tgz'),
+      'lodash@4.17.21',
+    );
+  });
+
+  await check('parseTarballUrl: an empty ident or an empty scope returns null', () => {
+    assert.equal(parseTarballUrl('https://registry.example/-/lodash-4.17.21.tgz'), null);
+    assert.equal(parseTarballUrl('https://registry.example/@/core/-/core-7.20.0.tgz'), null);
+  });
+
+  await check('parseTarballUrl: bad percent-encoding returns null', () => {
+    assert.equal(parseTarballUrl('https://registry.example/lo%zzdash/-/lo%zzdash-1.0.0.tgz'), null);
   });
 
   await check('parseTarballUrl: not a tarball URL at all (no /-/) returns null', () => {
@@ -256,6 +295,121 @@ async function main() {
       delete process.env.YARNSTATIC_ENDPOINT;
     }
   });
+
+  // --- resolveBinary() -------------------------------------------------------
+
+  // Runs fn with YARNSTATIC_BIN/GOBIN/GOPATH unset and HOME pointed at an
+  // empty dir, so only the project-local candidate can match.
+  async function withIsolatedBinEnv(fn) {
+    const saved = {};
+    for (const k of ['YARNSTATIC_BIN', 'GOBIN', 'GOPATH', 'HOME']) saved[k] = process.env[k];
+    const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-smoke-home-'));
+    delete process.env.YARNSTATIC_BIN;
+    delete process.env.GOBIN;
+    delete process.env.GOPATH;
+    process.env.HOME = emptyHome;
+    try {
+      await fn();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(emptyHome, {recursive: true, force: true});
+    }
+  }
+
+  function makeProject(binTarget) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-smoke-proj-'));
+    const target = path.join(root, 'node_modules', binTarget);
+    fs.mkdirSync(path.dirname(target), {recursive: true});
+    fs.writeFileSync(target, '#!/bin/sh\n', {mode: 0o755});
+    fs.mkdirSync(path.join(root, 'node_modules', '.bin'), {recursive: true});
+    fs.symlinkSync(path.join('..', binTarget), path.join(root, 'node_modules', '.bin', 'yarnstatic'));
+    return root;
+  }
+
+  await check('resolveBinary: accepts node_modules/.bin/yarnstatic when it resolves into @fortmesa/yarnstatic', async () => {
+    await withIsolatedBinEnv(() => {
+      const root = makeProject(path.join('@fortmesa', 'yarnstatic', 'bin', 'yarnstatic.js'));
+      try {
+        assert.equal(resolveBinary(root), path.join(root, 'node_modules', '.bin', 'yarnstatic'));
+      } finally {
+        fs.rmSync(root, {recursive: true, force: true});
+      }
+    });
+  });
+
+  await check('resolveBinary: skips node_modules/.bin/yarnstatic pointing at any other package', async () => {
+    await withIsolatedBinEnv(() => {
+      const root = makeProject(path.join('evil', 'bin.js'));
+      try {
+        // Present but unrelated: the bin must not be accepted just because
+        // @fortmesa/yarnstatic is also installed.
+        fs.mkdirSync(path.join(root, 'node_modules', '@fortmesa', 'yarnstatic'), {recursive: true});
+        assert.equal(resolveBinary(root), 'yarnstatic');
+      } finally {
+        fs.rmSync(root, {recursive: true, force: true});
+      }
+    });
+  });
+
+  // --- startDaemon() readiness probe -------------------------------------
+  // YARNSTATIC_BIN points at a stub "daemon" that listens on the socket it
+  // is given; no real yarnstatic binary or S3 is involved.
+
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-smoke-stub-'));
+  const stubPath = path.join(stubDir, 'stub-daemon');
+  fs.writeFileSync(stubPath, `#!${process.execPath}
+const fs = require('fs');
+const net = require('net');
+const sock = process.argv[process.argv.indexOf('--socket') + 1];
+if (process.env.STUB_OUT) fs.writeFileSync(process.env.STUB_OUT, sock);
+let n = 0;
+net.createServer((c) => {
+  n++;
+  if (process.env.STUB_MODE === 'silent') return;
+  if (n <= 2) { c.end('{"ok":true'); return; }
+  c.end('{"ok":true,"ver":"1.0","ready":true}\\n');
+}).listen(sock);
+setTimeout(() => process.exit(0), 5000);
+`, {mode: 0o755});
+
+  async function withStub(mode, fn) {
+    const saved = {YARNSTATIC_BIN: process.env.YARNSTATIC_BIN, STUB_MODE: process.env.STUB_MODE, STUB_OUT: process.env.STUB_OUT};
+    process.env.YARNSTATIC_BIN = stubPath;
+    process.env.STUB_MODE = mode;
+    process.env.STUB_OUT = path.join(stubDir, `socket-${mode}`);
+    try {
+      await fn(process.env.STUB_OUT);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  await check('startDaemon: a listener that accepts but never sends a greeting fails at the deadline', async () => {
+    await withStub('silent', async (outFile) => {
+      const started = Date.now();
+      await assert.rejects(startDaemon(null, {readyTimeoutMs: 400}), /did not become ready within 400ms/);
+      assert.ok(Date.now() - started < 3000, 'probe should not wait past its deadline');
+      const sock = fs.readFileSync(outFile, 'utf8');
+      assert.equal(path.basename(sock), 'daemon.sock');
+      assert.equal(fs.statSync(path.dirname(sock)).mode & 0o777, 0o700);
+    });
+  });
+
+  await check('startDaemon: connections that end before a full greeting line are retried', async () => {
+    await withStub('flaky', async () => {
+      const {socketPath, child} = await startDaemon(null, {readyTimeoutMs: 3000});
+      child.kill();
+      assert.equal(path.basename(socketPath), 'daemon.sock');
+    });
+  });
+
+  fs.rmSync(stubDir, {recursive: true, force: true});
 
   console.log(`\n${passed} check(s) passed.`);
 }

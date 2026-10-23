@@ -98,13 +98,14 @@ on the *same bytes* - just sourced from S3 instead of HTTP.
   access.
 - **Only requests that flow through `httpUtils`.** The hook wraps Yarn
   core's own HTTP layer, which is what the standard npm fetch path uses.
-  It does **not** catch a fetcher that shells out to an external binary
-  directly - e.g. `git`/`github`/`exec`-protocol dependencies may invoke
-  the system `git` binary rather than going through `httpUtils`. If your
-  `yarn.lock` contains only `npm:`-protocol dependencies (the common case),
-  this doesn't apply; `yarnstatic check` warns explicitly if it finds any
-  of these protocols, since they'd otherwise silently need real network
-  access despite `YARNSTATIC_BUCKET` being set.
+  It does **not** catch a fetcher that shells out to an external binary.
+  Yarn clones git dependencies with the system `git` binary, GitHub ones
+  too once their blocked tarball download fails, and `exec:` dependencies
+  run a script. If your `yarn.lock` contains only `npm:`-protocol
+  dependencies (the common case), this doesn't apply; `yarnstatic check`
+  warns explicitly if it finds any git or `exec:` entries, since they'd
+  otherwise silently need real network access despite `YARNSTATIC_BUCKET`
+  being set.
 
 ## Exec-once, socket-based fetching
 
@@ -126,8 +127,9 @@ for the daemon's spawn/reuse/teardown lifecycle.
 - **`cmd/yarnstatic`** (Go) - `check` (pre-flight: verify everything
   `yarn.lock` needs exists in S3), `fetch` (one-shot manual download), and
   `serve` (the daemon the plugin actually talks to). See [cli.md](cli.md).
-- **`internal/lockfile`** - parses `yarn.lock`, extracting npm-protocol,
-  checksummed entries and reporting what's skipped and why.
+- **`internal/lockfile`** - parses `yarn.lock`, extracting npm-protocol
+  entries, with and without a checksum, and reporting what's skipped and
+  why.
 - **`internal/verdaccio`** - npm identifier parsing and the
   `verdaccio-aws-s3-storage` S3 key formula. See [s3-layout.md](s3-layout.md).
 - **`internal/s3client`** - a thin AWS SDK v2 wrapper (existence checks,

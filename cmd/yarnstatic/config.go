@@ -58,19 +58,23 @@ func exitCodeForKind(kind s3client.ErrorKind) int {
 // flag always appear "set" and shadow YARNSTATIC_KEY_PREFIX entirely).
 const defaultKeyPrefix = "verdaccio"
 
-// resolveFlag implements the "flag wins if set, else env var, else empty"
-// rule shared by check/fetch/serve.
-func resolveFlag(flagVal, envVar string) string {
+// resolveFlag implements the "flag wins if set, else env var, else the
+// .yarnrc.yml value, else empty" rule shared by check/fetch/serve. Only
+// check reads .yarnrc.yml; fetch and serve pass "" for rcVal.
+func resolveFlag(flagVal, envVar, rcVal string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	return os.Getenv(envVar)
+	if v := os.Getenv(envVar); v != "" {
+		return v
+	}
+	return rcVal
 }
 
-// requireBucket resolves --bucket from either the flag or YARNSTATIC_BUCKET,
-// erroring if neither is set.
-func requireBucket(flagVal string) (string, error) {
-	bucket := resolveFlag(flagVal, "YARNSTATIC_BUCKET")
+// requireBucket resolves --bucket from the flag, YARNSTATIC_BUCKET or
+// yarnstaticBucket, erroring if none is set.
+func requireBucket(flagVal, rcVal string) (string, error) {
+	bucket := resolveFlag(flagVal, "YARNSTATIC_BUCKET", rcVal)
 	if bucket == "" {
 		return "", fmt.Errorf("--bucket is required (or set YARNSTATIC_BUCKET)")
 	}
@@ -97,18 +101,25 @@ func (f *commonFlags) register(fs *flag.FlagSet) {
 
 // resolve validates and merges commonFlags with their env var fallbacks.
 func (f *commonFlags) resolve() (bucket, keyPrefix string, opts s3client.Options, err error) {
-	bucket, err = requireBucket(f.bucket)
+	return f.resolveWith(yarnrcSettings{})
+}
+
+// resolveWith is resolve with rc's .yarnrc.yml values as the last fallback
+// for each setting, the precedence yarn-plugin-yarnstatic-s3 uses (an env
+// var over the .yarnrc.yml setting).
+func (f *commonFlags) resolveWith(rc yarnrcSettings) (bucket, keyPrefix string, opts s3client.Options, err error) {
+	bucket, err = requireBucket(f.bucket, rc.Bucket)
 	if err != nil {
 		return "", "", s3client.Options{}, err
 	}
-	keyPrefix = resolveFlag(f.keyPrefix, "YARNSTATIC_KEY_PREFIX")
+	keyPrefix = resolveFlag(f.keyPrefix, "YARNSTATIC_KEY_PREFIX", rc.KeyPrefix)
 	if keyPrefix == "" {
 		keyPrefix = defaultKeyPrefix
 	}
 	opts = s3client.Options{
-		Region:   resolveFlag(f.region, "YARNSTATIC_REGION"),
-		Endpoint: resolveFlag(f.endpoint, "YARNSTATIC_ENDPOINT"),
-		Profile:  resolveFlag(f.profile, "YARNSTATIC_PROFILE"),
+		Region:   resolveFlag(f.region, "YARNSTATIC_REGION", rc.Region),
+		Endpoint: resolveFlag(f.endpoint, "YARNSTATIC_ENDPOINT", rc.Endpoint),
+		Profile:  resolveFlag(f.profile, "YARNSTATIC_PROFILE", rc.Profile),
 	}
 	return bucket, keyPrefix, opts, nil
 }

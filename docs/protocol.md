@@ -19,11 +19,12 @@ implementations, not just the Go one.
 ## Transport
 
 A Unix domain socket. The path is chosen by whoever spawns `yarnstatic
-serve --socket <path>` - the plugin generates a fresh temp path per `yarn`
-process (see [plugin.md](plugin.md)).
+serve --socket <path>`. The plugin creates a private 0700 directory per
+`yarn` process and puts the socket in it (see [plugin.md](plugin.md)).
 
-**Permissions**: both `serve` implementations `chmod` the socket file to
-`0600` immediately after binding, regardless of the process umask. Without
+**Permissions**: both `serve` implementations create the socket file under
+umask 0077 and then `chmod` it to `0600`, regardless of the process umask.
+The umask covers the moment between bind and chmod. Without
 this, a permissive umask (0 or 002, common in root-run containers/some CI
 images) would leave the socket group/world-writable - the daemon has no
 per-caller/per-project scoping by design (see "Why this shape" below), so
@@ -107,7 +108,9 @@ raw tarball bytes, then closes the connection.
 ```json
 {"ok": true, "length": 12345}
 ```
-followed immediately by exactly `length` raw tarball bytes.
+followed immediately by exactly `length` raw tarball bytes. Every success
+response carries `length`, `0` for an empty object; the plugin rejects one
+without it.
 
 **Failure**, no body:
 ```json

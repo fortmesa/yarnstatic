@@ -16,8 +16,9 @@ Produces `bundles/@yarnpkg/plugin-yarnstatic.js` - a minified, comment-stripped
 bundle (built via `@yarnpkg/builder`, same as
 [`../yarn-plugin-yarnstatic-s3`](../yarn-plugin-yarnstatic-s3)). This has no
 external dependency to inline (only Node built-ins and `@yarnpkg/core`,
-both left external), so the build's only value is a smaller, comment-free
-distributable - functionally identical to `sources/index.js`.
+both left external), so the bundle runs the same code as
+`sources/index.js`. Import the bundle, though. `yarn plugin import` can't
+evaluate the top-level `require` calls in `sources/index.js`.
 
 ## Install
 
@@ -39,8 +40,9 @@ or by hand:
        spec: "https://internal.example.com/yarn-plugin-yarnstatic"
    ```
 
-   (`spec` is just a description of where the file came from - it's not
-   fetched at runtime.)
+   Yarn downloads the plugin from `spec` only when the file at `path` is
+   missing and `spec` is an http(s) URL. Otherwise `spec` is a note of
+   where the file came from.
 
 Machine-wide, for every project a user/CI image touches (e.g. baked into a
 shared CI base image):
@@ -57,7 +59,10 @@ Yarn reads `~/.yarnrc.yml` in addition to the project's own, and merges
 install applies to every project without touching each repo's own
 `.yarn/plugins/`. Since the plugin is a complete no-op unless
 `YARNSTATIC_BUCKET` is set, this is safe to leave installed everywhere and
-opt in per-build via the environment instead.
+opt in per-build via the environment instead. The exception is a project
+that imports `yarn-plugin-yarnstatic-s3`. Both plugins register
+`yarnstaticScopeStorage`, so Yarn fails every command in that project at
+startup with `Cannot redefine settings "yarnstaticScopeStorage"`.
 
 One caveat: a globally-installed plugin runs inside whichever
 `.yarn/releases/yarn-X.Y.Z.cjs` each individual project has pinned. This
@@ -69,7 +74,8 @@ versions, spot-check this on each.
 ## Requirements
 
 - The `yarnstatic` binary must be reachable. The plugin looks for it, in
-  order: the `YARNSTATIC_BIN` env var, `<project>/node_modules/.bin/yarnstatic`,
+  order: the `YARNSTATIC_BIN` env var, `<project>/node_modules/.bin/yarnstatic`
+  (only when it belongs to `@fortmesa/yarnstatic`),
   `$GOBIN`/`$GOPATH/bin`/`~/go/bin`, `~/.yarn/bin/yarnstatic`,
   `~/.local/bin/yarnstatic`, then falls back to `yarnstatic` on `PATH`.
 - AWS credentials must be resolvable by the standard AWS SDK credential
@@ -108,8 +114,8 @@ yarnstaticScopeStorage:
 Key by the scope name without the leading `@`; the value is whatever
 `storage:` value that scope has in Verdaccio's own config - only your
 Verdaccio admin config knows this, so it can't be inferred automatically.
-`yarnstatic check` reads this same key straight out of `.yarnrc.yml`, so
-one entry covers both. See
+`yarnstatic check` reads this same key from the same `.yarnrc.yml` files
+Yarn does, so one entry covers both. See
 [`../../docs/plugin.md`](../../docs/plugin.md#scope-storage-overrides-yarnstaticscopestorage)
 for the full mechanism. If no scope you use has this override (the common
 case), you don't need this setting at all.

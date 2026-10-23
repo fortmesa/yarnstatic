@@ -9,6 +9,7 @@
 # Go build/test artifacts
 *.test
 *.out
+/vendor/
 
 # Editor/OS cruft
 .DS_Store

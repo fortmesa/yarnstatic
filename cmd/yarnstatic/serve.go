@@ -57,10 +57,15 @@ const (
 // regardless of umask. Extracted from runServe() specifically so this
 // security property is directly unit-testable without needing a working S3
 // client (runServe's other dependency) just to reach this code.
+//
+// The socket is also created under umask 0077: with only the chmod, a
+// permissive umask leaves it connectable between Listen and Chmod.
 func listenOnUnixSocket(socketPath string) (net.Listener, error) {
 	_ = os.Remove(socketPath) // defensive: clear a stale socket file, if any
 
+	oldUmask := syscall.Umask(0o077)
 	listener, err := net.Listen("unix", socketPath)
+	syscall.Umask(oldUmask)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %w", socketPath, err)
 	}
@@ -101,6 +106,10 @@ Flags:
 	}
 	if socketPath == "" {
 		fmt.Fprintln(os.Stderr, "yarnstatic serve: --socket is required")
+		return exitUsage
+	}
+	if maxConcurrency < 1 {
+		fmt.Fprintln(os.Stderr, "yarnstatic serve: --max-concurrency must be at least 1")
 		return exitUsage
 	}
 
@@ -220,11 +229,14 @@ type request struct {
 //     {"ok": true, "ver": "1.0", "ready": true}
 //   - fetch success: {"ok": true, "length": N} (tarball bytes follow)
 //   - fetch failure: {"ok": false, "message": "..."}
+//
+// Length is a pointer so a success response carries "length": 0 for an
+// empty object, while the other two shapes leave it out.
 type response struct {
 	OK      bool   `json:"ok"`
 	Ver     string `json:"ver,omitempty"`
 	Ready   bool   `json:"ready,omitempty"`
-	Length  int    `json:"length,omitempty"`
+	Length  *int   `json:"length,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
@@ -346,7 +358,8 @@ func handleConn(ctx context.Context, conn net.Conn, client *s3client.Client, key
 		return
 	}
 
-	if err := writeJSONLine(conn, response{OK: true, Length: buf.Len()}); err != nil {
+	length := buf.Len()
+	if err := writeJSONLine(conn, response{OK: true, Length: &length}); err != nil {
 		return
 	}
 	_, _ = conn.Write(buf.Bytes())

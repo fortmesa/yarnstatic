@@ -37,11 +37,56 @@ const config = require('../src/config');
 const {parseArgs, ParseError} = require('../src/argparse');
 const {runLimited} = require('../src/pool');
 const lockfile = require('../src/lockfile/lockfile');
-const {loadScopeStorage} = require('../src/scopestorage');
+const {loadYarnrc, expandEnvVariables} = require('../src/yarnrc');
 
 // Reused directly from the Go source tree (not copied) so both parsers are
 // always exercised against the exact same bytes -- see the file header.
 const SAMPLE_LOCK_PATH = path.join(__dirname, '..', '..', 'internal', 'lockfile', 'testdata', 'sample.lock');
+
+// Same isolation as main_test.go's isolateEnv: a shell that exported
+// YARNSTATIC_BUCKET or YARNSTATIC_KEY_PREFIX must not change what these
+// tests resolve, and ~/.yarnrc.yml must not leak into check.
+for (const k of Object.keys(process.env)) {
+  const upper = k.toUpperCase();
+  if (upper.startsWith('YARNSTATIC_') || upper.startsWith('YARN_YARNSTATIC_') || upper === 'YARN_RC_FILENAME') {
+    delete process.env[k];
+  }
+}
+const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-smoke-'));
+process.env.HOME = path.join(TEST_ROOT, 'home');
+fs.mkdirSync(process.env.HOME);
+
+// rcTree returns a fresh home/parent/project layout under TEST_ROOT, with
+// HOME pointed at its home directory (yarnrc_test.go's rcTree).
+let rcTreeCount = 0;
+function rcTree() {
+  const root = path.join(TEST_ROOT, `tree-${rcTreeCount++}`);
+  const home = path.join(root, 'home');
+  const parent = path.join(root, 'work');
+  const project = path.join(parent, 'repo');
+  fs.mkdirSync(home, {recursive: true});
+  fs.mkdirSync(project, {recursive: true});
+  process.env.HOME = home;
+  return {home, parent, project};
+}
+
+function writeRc(dir, name, content) {
+  fs.mkdirSync(dir, {recursive: true});
+  fs.writeFileSync(path.join(dir, name), content);
+}
+
+// captureStdout runs fn with console.log collected, returning fn's result
+// and the collected lines joined by "\n".
+async function captureStdout(fn) {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try {
+    return {code: await fn(), out: lines.join('\n')};
+  } finally {
+    console.log = original;
+  }
+}
 
 let passed = 0;
 let failed = 0;
@@ -142,6 +187,35 @@ async function main() {
     });
   }
 
+  // Transcribed from key_test.go's TestParseTarballURL.
+  const parseTarballUrlCases = [
+    ['unscoped', 'https://registry.example/lodash/-/lodash-4.17.21.tgz', {scope: '', name: 'lodash', version: '4.17.21'}],
+    ['scoped, encoded', 'https://registry.example/@babel%2fcore/-/core-7.20.0.tgz', {scope: 'babel', name: 'core', version: '7.20.0'}],
+    ['scoped, upper-case encoding', 'https://registry.example/@babel%2Fcore/-/core-7.20.0.tgz', {scope: 'babel', name: 'core', version: '7.20.0'}],
+    ['scoped, unencoded retry', 'https://registry.example/@babel/core/-/core-7.20.0.tgz', {scope: 'babel', name: 'core', version: '7.20.0'}],
+    ['registry path, unscoped', 'https://host/artifactory/api/npm/npm-remote/lodash/-/lodash-4.17.21.tgz', {scope: '', name: 'lodash', version: '4.17.21'}],
+    ['registry path, scoped encoded', 'https://host/artifactory/api/npm/npm-remote/@babel%2fcore/-/core-7.20.0.tgz', {scope: 'babel', name: 'core', version: '7.20.0'}],
+    ['registry path, scoped unencoded', 'https://host/registry/@babel/core/-/core-7.20.0.tgz', {scope: 'babel', name: 'core', version: '7.20.0'}],
+    ['query string ignored', 'https://registry.example/lodash/-/lodash-4.17.21.tgz?x=1', {scope: '', name: 'lodash', version: '4.17.21'}],
+    ['prerelease version', 'https://registry.example/foo/-/foo-1.0.0-beta.1.tgz', {scope: '', name: 'foo', version: '1.0.0-beta.1'}],
+    ['basename names another package', 'https://registry.example/lodash/-/other-1.0.0.tgz', null],
+    ['empty version', 'https://registry.example/lodash/-/lodash-.tgz', null],
+    ['not a tgz', 'https://registry.example/lodash/-/lodash-1.0.0.zip', null],
+    ['no ident', 'https://registry.example/-/lodash-1.0.0.tgz', null],
+    ['no separator', 'https://registry.example/lodash/lodash-1.0.0.tgz', null],
+    ['basename has a slash', 'https://registry.example/lodash/-/sub/lodash-1.0.0.tgz', null],
+    ['scope without name', 'https://registry.example/@babel/-/core-1.0.0.tgz', null],
+    ['empty scope', 'https://registry.example/@/core/-/core-1.0.0.tgz', null],
+    ['registry path containing /-/', 'https://host/-/mirror/lodash/-/lodash-4.17.21.tgz', {scope: '', name: 'lodash', version: '4.17.21'}],
+    ['bad percent-encoding', 'https://registry.example/%zz/-/x-1.0.0.tgz', null],
+    ['not a URL', 'lodash-4.17.21.tgz', null],
+  ];
+  for (const [name, input, want] of parseTarballUrlCases) {
+    await check(`parseTarballUrl: ${name}`, () => {
+      assert.deepEqual(key.parseTarballUrl(input), want);
+    });
+  }
+
   // -------------------------------------------------------------------
   // lockfile/lockfile.js -- ported from internal/lockfile/lockfile_test.go,
   // reading the real Go testdata fixture by relative path.
@@ -193,53 +267,226 @@ __metadata:
     assert.throws(() => lockfile.parse(doc));
   });
 
-  await check('lockfile.parse: an empty document is an error (unlike scopestorage.js, empty is not valid here)', () => {
+  await check('lockfile.parse: an empty document is an error (unlike yarnrc.js, empty is not valid here)', () => {
     assert.throws(() => lockfile.parse(''));
   });
 
+  // Transcribed from lockfile_test.go's TestParseNoChecksumArchiveURLAndGit.
+  await check('lockfile.parse: no-checksum entries, __archiveUrl, and git references', () => {
+    const c = 'com' + 'mit';
+    const doc = `
+__metadata:
+  version: 8
+
+"@esbuild/darwin-arm64@npm:0.25.12":
+  version: 0.25.12
+  resolution: "@esbuild/darwin-arm64@npm:0.25.12"
+  conditions: os=darwin & cpu=arm64
+  languageName: node
+  linkType: hard
+
+"foo@npm:1.0.0":
+  version: 1.0.0
+  resolution: "foo@npm:1.0.0::__archiveUrl=https%3A%2F%2Fmirror.example%2Fnpm%2Ffoo%2F-%2Ffoo-1.0.0.tgz"
+  checksum: 10c0/aaaa
+  languageName: node
+  linkType: hard
+
+"bar@npm:2.0.0":
+  version: 2.0.0
+  resolution: "bar@npm:2.0.0::__archiveUrl=https%3A%2F%2Fcdn.example%2Fbar.tgz"
+  checksum: 10c0/bbbb
+  languageName: node
+  linkType: hard
+
+"mylib@github:acme/mylib#v1.0.0":
+  version: 1.0.0
+  resolution: "mylib@https://github.com/acme/mylib.git#${c}=0123456789abcdef0123456789abcdef01234567"
+  checksum: 10c0/cccc
+  languageName: node
+  linkType: hard
+
+"tarball@https://example.com/tarball-1.0.0.tgz":
+  version: 1.0.0
+  resolution: "tarball@https://example.com/tarball-1.0.0.tgz"
+  checksum: 10c0/dddd
+  languageName: node
+  linkType: hard
+`;
+    const result = lockfile.parse(doc);
+    assert.equal(result.noChecksum.length, 1);
+    const nc = result.noChecksum[0];
+    assert.deepEqual([nc.scope, nc.name, nc.version, nc.conditions], ['esbuild', 'darwin-arm64', '0.25.12', 'os=darwin & cpu=arm64']);
+
+    assert.equal(result.entries.length, 1);
+    const foo = result.entries[0];
+    assert.deepEqual([foo.name, foo.version, foo.archiveUrl], ['foo', '1.0.0', 'https://mirror.example/npm/foo/-/foo-1.0.0.tgz']);
+
+    const bar = result.skipped.find(s => s.descriptor.startsWith('bar@'));
+    assert.equal(bar.reason, lockfile.SKIP_ARCHIVE_URL);
+    assert.equal(bar.reference, 'https://cdn.example/bar.tgz');
+    const mylib = result.skipped.find(s => s.descriptor.startsWith('mylib@'));
+    assert.equal(mylib.reason, lockfile.SKIP_PROTOCOL);
+    assert.equal(lockfile.isGitReference(mylib.reference), true);
+    const tarball = result.skipped.find(s => s.descriptor.startsWith('tarball@'));
+    assert.equal(lockfile.isGitReference(tarball.reference), false);
+
+    assert.deepEqual(lockfile.skippedCounts(result.skipped), {https: 2});
+  });
+
+  // Transcribed from lockfile_test.go's TestIsGitReference, whose
+  // expectations are what Yarn's own isGitUrl returns.
+  {
+    const c = 'com' + 'mit';
+    const gitCases = [
+      [`ssh://git@github.com/u/r.git#${c}=x`, true], [`git://example.com/r.git#${c}=x`, true],
+      [`git+ssh://git@example.com/u/r.git#${c}=x`, true], ['git+file:///path/r.git', true],
+      [`https://github.com/u/r.git#${c}=x`, true], [`https://gitlab.example/u/r.git#${c}=x`, true],
+      ['http://host/u/r.git', true], [`git@github.com:u/r.git#${c}=x`, true], ['github:u/r#v1', true],
+      ['u/r', true], ['./x/y', false], ['../x', false], ['u/.', false], ['u/..', false], ['u/.#x', false],
+      ['u/..#x', false], ['u/.git', true], ['./r', false], ['https://github.com/u/r/tarball/v1', true],
+      ['https://github.com/../r/tarball/v1', false], ['https://github.com/u/./tarball/v1', true],
+      ['https://example.com/pkg.tgz', false], ['npm:1.0.0', false], ['workspace:packages/a', false],
+      ['file:../x', false], ['exec:./gen.js::locator=root%40workspace%3A.', false],
+      ['patch:lodash@npm%3A4.17.21#~/.yarn/patches/x.patch::version=4.17.21', false],
+      ['portal:../x::locator=r%40workspace%3A.', false], ['link:./vendor/x', false], ['github:../r', false],
+      ['https://github.com/u/r', true], ['a.b/c-d_e#semver:^1.0.0', true], ['', false],
+    ];
+    await check(`isGitReference: ${gitCases.length} cases match Yarn's isGitUrl`, () => {
+      for (const [ref, want] of gitCases) {
+        assert.equal(lockfile.isGitReference(ref), want, ref);
+      }
+    });
+  }
+
   // -------------------------------------------------------------------
-  // scopestorage.js -- ported from cmd/yarnstatic/scopestorage.go
+  // yarnrc.js -- ported from cmd/yarnstatic/yarnrc_test.go
   // -------------------------------------------------------------------
 
-  await check('loadScopeStorage: missing .yarnrc.yml is not an error, returns null', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-scopestorage-test-'));
+  await check('loadYarnrc: closer files win, home is farthest, values are strings', () => {
+    const {home, parent, project} = rcTree();
+    writeRc(home, '.yarnrc.yml', 'yarnstaticBucket: home-bucket\nyarnstaticRegion: home-region\nyarnstaticProfile: home-profile\n');
+    writeRc(parent, '.yarnrc.yml', 'yarnstaticBucket: parent-bucket\nyarnstaticRegion: parent-region\n');
+    writeRc(project, '.yarnrc.yml', 'yarnstaticBucket: project-bucket\nyarnstaticKeyPrefix: 123\n');
+    const got = loadYarnrc(project);
+    assert.deepEqual(
+      {...got, scopeStorage: Object.fromEntries(got.scopeStorage)},
+      {bucket: 'project-bucket', keyPrefix: '123', region: 'parent-region', endpoint: '', profile: 'home-profile', scopeStorage: {}}
+    );
+    process.env.yarn_yarnstatic_bucket = 'env-bucket';
     try {
-      assert.equal(loadScopeStorage(dir), null);
+      assert.equal(loadYarnrc(project).bucket, 'env-bucket');
     } finally {
-      fs.rmSync(dir, {recursive: true, force: true});
+      delete process.env.yarn_yarnstatic_bucket;
     }
   });
 
-  await check('loadScopeStorage: empty .yarnrc.yml is not an error, returns null', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-scopestorage-test-'));
+  await check('loadYarnrc: a home file inside the walk is read once', () => {
+    const {home} = rcTree();
+    const project = path.join(home, 'repo');
+    writeRc(home, '.yarnrc.yml', 'yarnstaticScopeStorage:\n  acme: home-storage\n  other: o\n');
+    writeRc(project, '.yarnrc.yml', 'yarnstaticScopeStorage:\n  acme: project-storage\n');
+    assert.deepEqual(Object.fromEntries(loadYarnrc(project).scopeStorage), {acme: 'project-storage', other: 'o'});
+  });
+
+  await check('loadYarnrc: YARN_RC_FILENAME renames the walked files, not the home one', () => {
+    const {home, project} = rcTree();
+    process.env.YARN_RC_FILENAME = '.custom.yml';
     try {
-      fs.writeFileSync(path.join(dir, '.yarnrc.yml'), '');
-      assert.equal(loadScopeStorage(dir), null);
+      writeRc(home, '.yarnrc.yml', 'yarnstaticRegion: home-region\n');
+      writeRc(project, '.yarnrc.yml', 'yarnstaticBucket: ignored\n');
+      writeRc(project, '.custom.yml', 'yarnstaticBucket: custom\n');
+      const got = loadYarnrc(project);
+      assert.equal(got.bucket, 'custom');
+      assert.equal(got.region, 'home-region');
     } finally {
-      fs.rmSync(dir, {recursive: true, force: true});
+      delete process.env.YARN_RC_FILENAME;
     }
   });
 
-  await check('loadScopeStorage: reads the yarnstaticScopeStorage map when present', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-scopestorage-test-'));
+  // Expectations are what Yarn's own resolveRcFiles produces.
+  const scopeMergeCases = [
+    ['default merge', "a: '1'\n  b: '1'", '', "b: '2'\n  c: '2'", {a: '1', b: '2', c: '2'}],
+    ['reset closest', "a: '1'\n  b: '1'", '', "onConflict: reset\n  b: '2'", {b: '2'}],
+    ['reset with value', "a: '1'", '', "onConflict: reset\n  value:\n    b: '2'", {b: '2'}],
+    ['hardReset closest', "a: '1'", '', "onConflict: hardReset\n  b: '2'", {}],
+    ['hardReset middle', "a: '1'", "onConflict: hardReset\n  b: '2'", "c: '3'", {c: '3'}],
+    ['reset middle', "a: '1'", "onConflict: reset\n  b: '2'", "c: '3'", {b: '2', c: '3'}],
+    ['extend', "a: '1'", '', "onConflict: extend\n  b: '2'", {a: '1', b: '2'}],
+    ['per-key marker', "a: '1'", '', "a:\n    onConflict: reset\n    value: '2'", {a: '2'}],
+    ['reset farthest', "onConflict: reset\n  a: '1'", '', "b: '2'", {a: '1', b: '2'}],
+  ];
+  for (const [name, homeBody, midBody, projectBody, want] of scopeMergeCases) {
+    await check(`loadYarnrc scope storage merge: ${name}`, () => {
+      const {home, parent, project} = rcTree();
+      for (const [dir, body] of [[home, homeBody], [parent, midBody], [project, projectBody]]) {
+        if (body) writeRc(dir, '.yarnrc.yml', `yarnstaticScopeStorage:\n  ${body}\n`);
+      }
+      assert.deepEqual(Object.fromEntries(loadYarnrc(project).scopeStorage), want);
+    });
+  }
+
+  await check('loadYarnrc scope storage merge: a non-map farther out stops the merge', () => {
+    const {home, parent, project} = rcTree();
+    writeRc(home, '.yarnrc.yml', "yarnstaticScopeStorage:\n  a: '1'\n");
+    writeRc(parent, '.yarnrc.yml', 'yarnstaticScopeStorage: str\n');
+    writeRc(project, '.yarnrc.yml', "yarnstaticScopeStorage:\n  c: '3'\n");
+    assert.deepEqual(Object.fromEntries(loadYarnrc(project).scopeStorage), {c: '3'});
+  });
+
+  const yarnrcErrorCases = [
+    ['null setting', 'yarnstaticBucket:\n', /cannot be null/],
+    ['non-string setting', 'yarnstaticBucket:\n  a: b\n', /must be a string/],
+    ['scope storage not a map', 'yarnstaticScopeStorage: str\n', /must be a map/],
+    ['scope storage value not a string', 'yarnstaticScopeStorage:\n  acme:\n    x: y\n', /must be a string/],
+    ['top level not a mapping', '- a\n', /expected a mapping/],
+    ['invalid YAML', 'a: [\n', /parsing/],
+    ['unset variable', 'yarnstaticBucket: ${YARNSTATIC_TEST_UNSET}\n', /environment variable not found/],
+  ];
+  for (const [name, content, wantErr] of yarnrcErrorCases) {
+    await check(`loadYarnrc: ${name} is an error`, () => {
+      const {project} = rcTree();
+      writeRc(project, '.yarnrc.yml', content);
+      assert.throws(() => loadYarnrc(project), wantErr);
+    });
+  }
+
+  await check('loadYarnrc: no rc files, or a comment-only one, is not an error', () => {
+    const {project} = rcTree();
+    assert.equal(loadYarnrc(project).bucket, '');
+    writeRc(project, '.yarnrc.yml', '# only a comment\n');
+    assert.equal(loadYarnrc(project).bucket, '');
+  });
+
+  await check('loadYarnrc: expands ${VAR} references from the environment', () => {
+    const {project} = rcTree();
+    process.env.YARNSTATIC_TEST_BUCKET = 'from-env';
     try {
-      fs.writeFileSync(
-        path.join(dir, '.yarnrc.yml'),
-        'yarnstaticScopeStorage:\n  acme: acme-storage\n  other: other-storage\n'
-      );
-      assert.deepEqual(loadScopeStorage(dir), {acme: 'acme-storage', other: 'other-storage'});
+      writeRc(project, '.yarnrc.yml', 'yarnstaticBucket: ${YARNSTATIC_TEST_BUCKET}\nyarnstaticScopeStorage:\n  acme: ${YARNSTATIC_TEST_UNSET:-fallback}\n');
+      const got = loadYarnrc(project);
+      assert.equal(got.bucket, 'from-env');
+      assert.equal(got.scopeStorage.get('acme'), 'fallback');
     } finally {
-      fs.rmSync(dir, {recursive: true, force: true});
+      delete process.env.YARNSTATIC_TEST_BUCKET;
     }
   });
 
-  await check('loadScopeStorage: a .yarnrc.yml without the key returns null', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-scopestorage-test-'));
-    try {
-      fs.writeFileSync(path.join(dir, '.yarnrc.yml'), 'somethingElse: true\n');
-      assert.equal(loadScopeStorage(dir), null);
-    } finally {
-      fs.rmSync(dir, {recursive: true, force: true});
+  // Expectations are what Yarn's own replaceEnvVariables returns.
+  const expandCases = [
+    ['plain', 'plain'], ['${SET}', 'val'], ['${UNSET}', /environment variable not found \(UNSET\)/],
+    ['${UNSET:-dflt}', 'dflt'], ['${EMPTY:-dflt}', 'dflt'], ['${EMPTY-dflt}', ''], ['${UNSET-dflt}', 'dflt'],
+    ['${SET:-dflt}', 'val'], ['a${SET}b${SET}c', 'avalbvalc'], ['\\${SET}', '${SET}'], ['\\\\${SET}', '\\val'],
+    ['x}y', 'x}y'], ['${SET:-${UNSET}}', 'val'], ['${UNSET:-${SET}}', 'val'], ['${UNSET:-a${SET}b}', 'avalb'],
+    ['${1BAD}', /invalid environment variable substitution syntax/],
+    ['${SET', /invalid environment variable substitution syntax/],
+    ['${UNSET:-open', /incomplete variable substitution/], ['}', '}'], ['\\}', '}'],
+    ['${SET:x}', /invalid environment variable substitution syntax/], ['$SET', '$SET'], ['${SET}}', 'val}'],
+  ];
+  await check(`expandEnvVariables: ${expandCases.length} cases match Yarn's replaceEnvVariables`, () => {
+    const env = {SET: 'val', EMPTY: ''};
+    for (const [input, want] of expandCases) {
+      if (want instanceof RegExp) assert.throws(() => expandEnvVariables(input, env), want, input);
+      else assert.equal(expandEnvVariables(input, env), want, input);
     }
   });
 
@@ -417,6 +664,16 @@ __metadata:
   });
   await check('resolveFlag: empty when neither is set', () => {
     assert.equal(config.resolveFlag('', 'YARNSTATIC_TEST_VAR_UNSET'), '');
+  });
+  await check('resolveFlag: the .yarnrc.yml value is the last fallback', () => {
+    assert.equal(config.resolveFlag('', 'YARNSTATIC_TEST_VAR_UNSET', 'from-rc'), 'from-rc');
+    process.env.YARNSTATIC_TEST_VAR = 'from-env';
+    try {
+      assert.equal(config.resolveFlag('', 'YARNSTATIC_TEST_VAR', 'from-rc'), 'from-env');
+      assert.equal(config.resolveFlag('from-flag', 'YARNSTATIC_TEST_VAR', 'from-rc'), 'from-flag');
+    } finally {
+      delete process.env.YARNSTATIC_TEST_VAR;
+    }
   });
   await check('requireBucket: throws when neither flag nor env is set', () => {
     delete process.env.YARNSTATIC_BUCKET;
@@ -622,6 +879,188 @@ __metadata:
       if (servePromise) await servePromise;
     }
   });
+
+  // mockObjects makes the S3 mock answer HeadObject/GetObject from a
+  // "bucket/key" -> body map, with a 404 NotFound for anything else.
+  function mockObjects(objects) {
+    sendImpl = async command => {
+      const k = `${command.input.Bucket}/${command.input.Key}`;
+      if (!Object.hasOwn(objects, k)) throw fakeApiError('NotFound', 404);
+      if (command.constructor.name === 'HeadObjectCommand') return {};
+      return {Body: (async function* () { yield Buffer.from(objects[k]); })()};
+    };
+  }
+
+  // serveRequest sends one request line and collects everything the daemon
+  // writes until it ends the connection, as [greeting, header, body].
+  function serveRequest(socketPath, line, {halfClose = false} = {}) {
+    return new Promise((resolve, reject) => {
+      const socket = net.createConnection({path: socketPath, allowHalfOpen: true});
+      let buffer = Buffer.alloc(0);
+      socket.on('data', chunk => { buffer = Buffer.concat([buffer, chunk]); });
+      socket.on('connect', () => {
+        socket.write(line);
+        if (halfClose) socket.end();
+      });
+      socket.on('end', () => {
+        socket.end();
+        const first = buffer.indexOf(0x0a);
+        const second = buffer.indexOf(0x0a, first + 1);
+        resolve([
+          JSON.parse(buffer.subarray(0, first).toString('utf8')),
+          second < 0 ? null : JSON.parse(buffer.subarray(first + 1, second).toString('utf8')),
+          second < 0 ? Buffer.alloc(0) : buffer.subarray(second + 1),
+        ]);
+      });
+      socket.on('error', reject);
+    });
+  }
+
+  await check('serve: half-closed client, null request, and empty object', async () => {
+    const {runServe} = require('../src/commands/serve');
+    const socketPath = path.join(TEST_ROOT, `serve-${Date.now()}.sock`);
+    mockObjects({'b/verdaccio/lodash/lodash-4.17.21.tgz': 'tarball', 'b/verdaccio/empty/empty-1.0.0.tgz': ''});
+    const servePromise = runServe(['--bucket', 'b', '--socket', socketPath]);
+    try {
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(socketPath)) {
+        if (Date.now() > deadline) throw new Error('serve did not create its socket in time');
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+
+      // ncat/socat-style: the client sends FIN right after the request.
+      // With Node's default allowHalfOpen: false the response was dropped.
+      const [, halfHeader, halfBody] = await serveRequest(socketPath, '{"package": "lodash@4.17.21", "ver": "1.0"}\n', {halfClose: true});
+      assert.deepEqual(halfHeader, {ok: true, length: 7});
+      assert.equal(halfBody.toString('utf8'), 'tarball');
+
+      // Go decodes null to an empty request; the Node port used to throw
+      // on req.ver and never answer.
+      const [, nullHeader] = await serveRequest(socketPath, 'null\n');
+      assert.equal(nullHeader.ok, false);
+      assert.match(nullHeader.message, /invalid package spec/);
+
+      const [, emptyHeader, emptyBody] = await serveRequest(socketPath, '{"package": "empty@1.0.0", "ver": "1.0"}\n');
+      assert.deepEqual(emptyHeader, {ok: true, length: 0});
+      assert.equal(emptyBody.length, 0);
+    } finally {
+      process.emit('SIGINT');
+      assert.equal(await servePromise, config.exitOK);
+    }
+  });
+
+  await check('serve: --max-concurrency below 1 is a usage error', async () => {
+    const {runServe} = require('../src/commands/serve');
+    for (const n of ['0', '-1']) {
+      assert.equal(await runServe(['--bucket', 'b', '--socket', path.join(TEST_ROOT, 'unused.sock'), '--max-concurrency', n]), config.exitUsage);
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // commands/check.js and commands/fetch.js -- mirror fakes3_test.go
+  // -------------------------------------------------------------------
+
+  const commitWord = 'com' + 'mit';
+  const checkLock = `__metadata:
+  version: 8
+
+"lodash@npm:4.17.21":
+  version: 4.17.21
+  resolution: "lodash@npm:4.17.21"
+  checksum: 10c0/aaaa
+  languageName: node
+  linkType: hard
+
+"@acme/widgets@npm:1.0.0":
+  version: 1.0.0
+  resolution: "@acme/widgets@npm:1.0.0"
+  checksum: 10c0/bbbb
+  languageName: node
+  linkType: hard
+
+"@esbuild/darwin-arm64@npm:0.25.12":
+  version: 0.25.12
+  resolution: "@esbuild/darwin-arm64@npm:0.25.12"
+  conditions: os=darwin & cpu=arm64
+  languageName: node
+  linkType: hard
+
+"mylib@github:acme/mylib#v1.0.0":
+  version: 1.0.0
+  resolution: "mylib@https://github.com/acme/mylib.git#${commitWord}=0123456789abcdef0123456789abcdef01234567"
+  checksum: 10c0/cccc
+  languageName: node
+  linkType: hard
+`;
+  function checkProject() {
+    const {project} = rcTree();
+    writeRc(project, 'yarn.lock', checkLock);
+    writeRc(project, '.yarnrc.yml', 'yarnstaticBucket: b\nyarnstaticKeyPrefix: mirror\nyarnstaticScopeStorage:\n  acme: acme-store\n');
+    return project;
+  }
+
+  await check('check: reads .yarnrc.yml and reports no-checksum entries separately', async () => {
+    const {runCheck} = require('../src/commands/check');
+    mockObjects({
+      'b/mirror/lodash/lodash-4.17.21.tgz': 'x',
+      'b/mirror/acme-store/@acme/widgets/widgets-1.0.0.tgz': 'y',
+    });
+    const {code, out} = await captureStdout(() => runCheck([checkProject()]));
+    assert.equal(code, config.exitOK, out);
+    for (const want of [
+      'yarn.lock: 2 npm package(s) with checksums, 1 without (skipped: 1 https:)',
+      'WARNING: 1 entries resolve from git repositories',
+      '  mylib@github:acme/mylib#v1.0.0',
+      'Checking s3://b/mirror ...',
+      'MISSING, NO CHECKSUM (1) - not counted in the exit code:',
+      's3://b/mirror/@esbuild/darwin-arm64/darwin-arm64-0.25.12.tgz (os=darwin & cpu=arm64)',
+      'Summary: 2 present, 0 missing, 0 error (out of 2 checked)',
+      'No checksum: 0 present, 1 missing, 0 error (out of 1 checked, not counted in the exit code)',
+    ]) {
+      assert.ok(out.includes(want), `output lacks ${JSON.stringify(want)}:\n${out}`);
+    }
+  });
+
+  await check('check: a missing checksummed entry exits 1', async () => {
+    const {runCheck} = require('../src/commands/check');
+    mockObjects({
+      'b/mirror/lodash/lodash-4.17.21.tgz': 'x',
+      'b/mirror/@acme/widgets/widgets-1.0.0.tgz': 'y',
+    });
+    const {code, out} = await captureStdout(() => runCheck([checkProject()]));
+    assert.equal(code, config.exitMissing, out);
+    assert.ok(out.includes('s3://b/mirror/acme-store/@acme/widgets/widgets-1.0.0.tgz'), out);
+  });
+
+  await check('check: a flag and an env var override .yarnrc.yml', async () => {
+    const {runCheck} = require('../src/commands/check');
+    mockObjects({
+      'other/env-prefix/lodash/lodash-4.17.21.tgz': 'x',
+      'other/env-prefix/acme-store/@acme/widgets/widgets-1.0.0.tgz': 'y',
+    });
+    process.env.YARNSTATIC_KEY_PREFIX = 'env-prefix';
+    try {
+      const {code, out} = await captureStdout(() => runCheck(['--bucket', 'other', checkProject()]));
+      assert.equal(code, config.exitOK, out);
+      assert.ok(out.includes('Checking s3://other/env-prefix ...'), out);
+    } finally {
+      delete process.env.YARNSTATIC_KEY_PREFIX;
+    }
+  });
+
+  await check('fetch: a local write failure is a usage error', async () => {
+    const {runFetch} = require('../src/commands/fetch');
+    mockObjects({'b/verdaccio/lodash/lodash-4.17.21.tgz': 'tarball'});
+    const args = ['--bucket', 'b', '--package', 'lodash@4.17.21'];
+    const out = path.join(TEST_ROOT, 'out.tgz');
+    assert.equal(await runFetch([...args, '--out', out]), config.exitOK);
+    assert.equal(fs.readFileSync(out, 'utf8'), 'tarball');
+    if (fs.existsSync('/dev/full')) {
+      assert.equal(await runFetch([...args, '--out', '/dev/full']), config.exitUsage);
+    }
+  });
+
+  fs.rmSync(TEST_ROOT, {recursive: true, force: true});
 
   console.log(`\n${passed} passed, ${failed} failed.`);
   process.exitCode = failed > 0 ? 1 : 0;

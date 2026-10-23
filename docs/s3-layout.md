@@ -47,8 +47,9 @@ with `storage` set, `packagePath = keyPrefix + storage + "/" + packageName`
 string reproduces the plain layout above). There's no way to derive which
 scopes need this from the package spec alone - it's admin-configured data
 that only Verdaccio's own config knows - so it has to be supplied
-separately: `yarnstatic check` reads it from `<path>/.yarnrc.yml`'s
-`yarnstaticScopeStorage` key, and `yarnstatic serve` gets it per-request
+separately: `yarnstatic check` reads the `yarnstaticScopeStorage` setting
+from the same `.yarnrc.yml` files Yarn loads, and `yarnstatic serve` gets
+it per-request
 from the plugin over the wire protocol. See [plugin.md](plugin.md)'s
 "Scope storage overrides" section and [protocol.md](protocol.md) for the
 full mechanism. `yarnstatic fetch` doesn't support it (no project

@@ -79,6 +79,62 @@ function splitIdentAndSuffix(s) {
   return {ident: s.slice(0, at), suffix: s.slice(at + 1)};
 }
 
+// parseTarballUrl parses a URL in Yarn's npm tarball shape,
+// {registry}/{ident}/-/{name}-{version}.tgz, the way both Yarn plugins'
+// parseTarballUrl does, so check can tell which key the plugins fetch for
+// an __archiveUrl. The registry may have a path of its own; only the
+// segments right before the last "/-/" name the package: "name",
+// "@scope%2fname", or "@scope/name" (the unencoded form Yarn retries with).
+// Returns {scope, name, version} (scope '' if unscoped), or null for
+// anything the plugins would block. Ported from key.go's ParseTarballURL.
+function parseTarballUrl(target) {
+  let url;
+  try {
+    url = new URL(target);
+  } catch {
+    return null;
+  }
+
+  const sepIndex = url.pathname.lastIndexOf('/-/');
+  if (sepIndex < 0) return null;
+
+  const segments = url.pathname.slice(0, sepIndex).split('/');
+  const last = segments[segments.length - 1];
+  const prev = segments.length > 2 ? segments[segments.length - 2] : '';
+  const identSegment = !last.startsWith('@') && prev.startsWith('@') ? `${prev}/${last}` : last;
+  const basename = url.pathname.slice(sepIndex + 3);
+  if (identSegment === '' || !basename.endsWith('.tgz') || basename.includes('/')) {
+    return null;
+  }
+
+  let ident;
+  try {
+    ident = decodeURIComponent(identSegment);
+  } catch {
+    return null;
+  }
+
+  let scope = '';
+  let name = ident;
+  if (ident.startsWith('@')) {
+    const slash = ident.indexOf('/');
+    if (slash < 0) return null;
+    scope = ident.slice(1, slash);
+    name = ident.slice(slash + 1);
+    if (!scope || !name) return null;
+  } else if (ident.includes('/')) {
+    return null;
+  }
+
+  const base = basename.slice(0, -4); // strip ".tgz"
+  const prefix = `${name}-`;
+  if (!base.startsWith(prefix)) return null;
+  const version = base.slice(prefix.length);
+  if (!version) return null;
+
+  return {scope, name, version};
+}
+
 // parsePackageSpec parses --package values of the form "name@version" or
 // "@scope/name@version".
 function parsePackageSpec(s) {
@@ -107,5 +163,6 @@ module.exports = {
   tarballKey,
   splitIdent,
   splitIdentAndSuffix,
+  parseTarballUrl,
   parsePackageSpec,
 };

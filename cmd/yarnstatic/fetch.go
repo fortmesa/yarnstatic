@@ -62,24 +62,42 @@ Flags:
 		return exitConfiguration
 	}
 
-	var w io.Writer = os.Stdout
+	var f *os.File
+	dest := "stdout"
+	w := &localWriter{w: os.Stdout}
 	if out != "" {
-		f, err := os.Create(out)
+		f, err = os.Create(out)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "yarnstatic fetch: %v\n", err)
 			return exitUsage
 		}
-		defer f.Close()
-		w = f
+		dest = out
+		w.w = f
 	}
 
 	// fetch is a standalone manual/debug tool with no project directory to
 	// read a .yarnrc.yml from (unlike check/serve), so it doesn't support
 	// per-scope storage-folder overrides - see docs/s3-layout.md.
 	key, err := downloadPackage(ctx, client, keyPrefix, spec, "", w)
+	if err == nil && f != nil {
+		// Some filesystems (NFS, quota-limited ones) only report a failed
+		// write when the file is closed.
+		if cerr := f.Close(); cerr != nil {
+			w.err = cerr
+			err = cerr
+		}
+	} else if f != nil {
+		_ = f.Close()
+	}
 	if err != nil {
 		if out != "" {
 			_ = os.Remove(out)
+		}
+		if w.err != nil {
+			// A local write failure, not an S3 one - see docs/cli.md's fetch
+			// exit codes.
+			fmt.Fprintf(os.Stderr, "yarnstatic fetch: writing %s: %v\n", dest, w.err)
+			return exitUsage
 		}
 		kind := s3client.Classify(err)
 		switch kind {
@@ -101,4 +119,19 @@ Flags:
 	}
 
 	return exitOK
+}
+
+// localWriter records a failure writing the output, so runFetch can tell it
+// apart from an S3 failure once the download returns its error.
+type localWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (l *localWriter) Write(p []byte) (int, error) {
+	n, err := l.w.Write(p)
+	if err != nil && l.err == nil {
+		l.err = err
+	}
+	return n, err
 }

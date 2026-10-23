@@ -16,10 +16,20 @@ Every *connection* setting is an environment variable first; each
 command's flags are just explicit overrides of the same values. This is
 what lets the manually-run `check` command and the plugin-invoked `serve`
 daemon share one identical configuration contract without the plugin
-needing to translate or forward anything (see [plugin.md](plugin.md)). The
-one exception is `yarnstaticScopeStorage`, which lives in `.yarnrc.yml`
-instead - see `check`'s entry below and [plugin.md](plugin.md)'s "Scope
-storage overrides" section.
+needing to translate or forward anything (see [plugin.md](plugin.md)).
+
+`check` also reads `.yarnrc.yml`, because `yarn-plugin-yarnstatic-s3`
+accepts every connection setting there too (`yarnstaticBucket`,
+`yarnstaticKeyPrefix`, `yarnstaticRegion`, `yarnstaticEndpoint`,
+`yarnstaticProfile`), and both plugins read `yarnstaticScopeStorage` from
+it. For each setting a flag wins, then the `YARNSTATIC_*` env var, then the
+`.yarnrc.yml` value, the same order the S3 plugin uses. `check` loads the
+files Yarn loads: `.yarnrc.yml` in the project directory and in every
+parent up to `/`, plus `~/.yarnrc.yml`. `YARN_RC_FILENAME` renames the
+per-directory file, as it does for Yarn. A closer file overrides a farther
+one, `YARN_YARNSTATIC_*` env vars override every file, and `${VAR}`,
+`${VAR:-default}` and `${VAR-default}` expand from the environment. It
+doesn't read `.env.yarn`. `fetch` and `serve` read flags and env vars only.
 
 | Env var | Flag | Required? | Fallback if unset |
 |---|---|---|---|
@@ -45,22 +55,37 @@ with no prefix at all needs to be supported.
 Flags must precede the positional `path` argument (Go's `flag` package
 stops parsing at the first non-flag token). `path` defaults to `.`.
 
-Parses `<path>/yarn.lock`, filters to `npm:`-protocol entries with a
-`checksum` field, and concurrently `HeadObject`-checks each one's S3 key.
-Prints a full report - every missing/errored object, not just the first -
-and exits accordingly.
+Parses `<path>/yarn.lock`, takes its `npm:`-protocol entries, and
+concurrently `HeadObject`-checks each one's S3 key. Prints a full report -
+every missing/errored object, not just the first - and exits accordingly.
+
+npm entries without a `checksum` field are checked too, in a group of
+their own that never affects the exit code. Yarn leaves the checksum off
+platform-specific packages (`@esbuild/darwin-arm64` and the like, marked
+`conditions:` in `yarn.lock`) when the lockfile was written on another
+platform, yet an install on a matching platform still fetches them from
+S3. A mirror built for Linux alone may lack them on purpose, so `check`
+lists the missing ones with their conditions and leaves the call to you.
+
+An npm entry whose resolution carries an `__archiveUrl` is checked at the
+key the plugins compute from that URL. Yarn records one when the
+registry's tarball URL isn't the conventional one, and fetches that URL
+instead. If the plugins can't parse it as a tarball URL they block the
+fetch, and `check` warns.
 
 Entries with a non-`npm` resolution protocol (`workspace:`, `portal:`,
-`link:`, `patch:`, `file:`, ...) or missing a checksum are skipped and
-summarized by protocol. `git:`/`github:`/`exec:` entries get an additional,
-louder warning: they bypass the plugin's network-blocking guarantee
-entirely (see [architecture.md](architecture.md)), so their presence means
-"fully offline" isn't actually guaranteed even if this check otherwise
-passes.
+`link:`, `patch:`, `file:`, ...) are skipped and summarized by protocol.
+Two kinds get a louder warning, because they bypass the plugin's network
+block (see [architecture.md](architecture.md)) and so mean "fully
+offline" isn't guaranteed even when this check passes. One is git
+dependencies, which Yarn clones with `git`. `check` finds them with Yarn's
+own git URL patterns, since `yarn.lock` records most of them as `https:`
+references (`https://github.com/acme/lib.git#commit=...`), not as a `git:`
+or `github:` protocol. The other is `exec:` entries.
 
 ```
 $ yarnstatic check --bucket my-verdaccio-bucket .
-yarn.lock: 52 npm package(s) with checksums (skipped: 1 link:, 2 patch:, 1 portal:, 3 workspace:)
+yarn.lock: 52 npm package(s) with checksums, 0 without (skipped: 1 link:, 2 patch:, 1 portal:, 3 workspace:)
 Checking s3://my-verdaccio-bucket/verdaccio ...
 
 MISSING (2):
@@ -72,14 +97,16 @@ Summary: 50 present, 2 missing, 0 error (out of 52 checked)
 
 (`verdaccio` here is the default `--key-prefix` - pass a different value with `--key-prefix` if your bucket doesn't use that layout.)
 
-If `<path>/.yarnrc.yml` exists and has a `yarnstaticScopeStorage` map (the
-same setting the Yarn plugin registers - see [plugin.md](plugin.md) and
-[s3-layout.md](s3-layout.md)), `check` uses it to compute the correct S3
-key for scopes with a Verdaccio `packages[...].storage` override. A
-missing file, or a file without that key, is not an error - it just means
-no scope needs the override, which is the common case. There's no flag or
-env var for this; `.yarnrc.yml` is the only source, so it can't drift out
-of sync with what the plugin itself reads.
+`check` reads the `yarnstaticScopeStorage` map (the setting both Yarn
+plugins register, see [plugin.md](plugin.md) and
+[s3-layout.md](s3-layout.md)) from the same `.yarnrc.yml` files as the
+settings above, and uses it to compute the correct S3 key for scopes with
+a Verdaccio `packages[...].storage` override. It merges the map across
+files the way Yarn does. A closer file's entry for a scope wins, and
+`onConflict: reset` on a file's map drops what farther files set
+(`hardReset` drops that file's map too). No file, or no key, is not an
+error; it just means no scope needs the override, which is the common
+case. There's no flag or env var for this setting.
 
 Each errored entry is also tagged with its error kind (see below), and the
 `ERRORS` section's summary line breaks the count down by kind, so a script
@@ -90,11 +117,14 @@ log in" apart from "these specific objects are missing."
 |---|---|
 | 0 | every entry present |
 | 1 | one or more entries confirmed missing from the bucket, nothing worse |
-| 2 | bad flags, too many arguments, no `yarn.lock` found, or unparseable `.yarnrc.yml` |
+| 2 | bad flags, too many arguments, no `yarn.lock` found, or an unreadable or invalid `.yarnrc.yml` (a parse error, a setting of the wrong type, or a `${VAR}` that isn't set) |
 | 3 | invalid S3 configuration - missing `--bucket`/`YARNSTATIC_BUCKET`, or `s3client.New`/a request failed for a locally-detectable reason (bad region, malformed `--endpoint`, a `--profile` that doesn't exist) |
 | 4 | no AWS credentials could be resolved at all on one or more entries |
 | 5 | one or more entries were denied on auth/permission grounds (and none hit 3 or 4) |
 | 6 | some other S3 error on one or more entries (throttling, a transient server error, an archived object needing a restore, ...) |
+
+Entries in the no-checksum group never change the exit code, whether
+they're missing or hit an error.
 
 When a run's errors span more than one kind, the exit code reflects the
 single most fundamental problem present, in the order listed above (3 > 4 >
@@ -134,7 +164,7 @@ text goes to stderr, so `fetch ... > file.tgz` is always safe.
 |---|---|
 | 0 | tarball written successfully |
 | 1 | not found (see `check`'s own note above on this being ambiguous with access denied if the role lacks `s3:ListBucket`) |
-| 2 | bad flags, bad `--package`, or a local (non-S3) failure writing `--out` |
+| 2 | bad flags, bad `--package`, or a local (non-S3) failure writing the output, to `--out` (closing the file included) or to stdout |
 | 3 | invalid S3 configuration - missing `--bucket`/`YARNSTATIC_BUCKET`, or the same locally-detectable `s3client.New`/request failures described under `check` |
 | 4 | no AWS credentials could be resolved at all |
 | 5 | access denied |
@@ -156,12 +186,12 @@ hardcoded) - the latter is a safety net in case whatever spawned it is
 killed ungracefully and never sends a signal.
 
 `--max-concurrency` (default 32) bounds how many downloads run at once,
-independent of how many connections are accepted.
+independent of how many connections are accepted. It must be at least 1.
 
 | Exit code | Meaning |
 |---|---|
 | 0 | clean shutdown on `SIGINT`/`SIGTERM`/idle timeout |
-| 2 | bad flags, `--socket` missing, or failure to bind the socket |
+| 2 | bad flags, `--socket` missing, `--max-concurrency` below 1, or failure to bind the socket |
 | 3 | invalid S3 configuration at startup - missing `--bucket`/`YARNSTATIC_BUCKET`, or `s3client.New` failed (bad region, malformed `--endpoint`, a `--profile` that doesn't exist) |
 
 Per-request errors are never a process exit code - they go back to the
@@ -184,7 +214,7 @@ real release tag to embed at that point.
 A release binary gets its version baked in at build time
 (`-ldflags "-X main.version=..."` in `.github/workflows/release.yml`'s
 `build` job), set to the exact git tag (`github.ref_name`) that release is
-published under - the same value `softprops/action-gh-release` uses for
+published under - the same value `gh release` uses for
 the release itself, so a binary's own `yarnstatic version` output and the
 GitHub Release it was downloaded from can never disagree. Useful for
 confirming exactly which build ended up on a given machine/CI runner,

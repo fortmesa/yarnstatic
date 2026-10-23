@@ -4,6 +4,7 @@ package verdaccio
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -97,6 +98,67 @@ func SplitIdent(ident string) (scope, name string, err error) {
 		return "", "", fmt.Errorf("%q: malformed scoped package name", ident)
 	}
 	return scope, name, nil
+}
+
+// ParseTarballURL parses a URL in Yarn's npm tarball shape,
+// {registry}/{ident}/-/{name}-{version}.tgz, the way both Yarn plugins'
+// parseTarballUrl does, so check can tell which key the plugins fetch for
+// an __archiveUrl. The registry may have a path of its own; only the
+// segments right before the last "/-/" name the package: "name",
+// "@scope%2fname", or "@scope/name" (the unencoded form Yarn retries with).
+// It reports false for anything the plugins would block.
+func ParseTarballURL(target string) (PackageSpec, bool) {
+	u, err := url.Parse(target)
+	if err != nil || u.Scheme == "" || u.Opaque != "" {
+		return PackageSpec{}, false
+	}
+	p := u.EscapedPath()
+
+	sep := strings.LastIndex(p, "/-/")
+	if sep < 0 {
+		return PackageSpec{}, false
+	}
+	basename := p[sep+3:]
+	if !strings.HasSuffix(basename, ".tgz") || strings.Contains(basename, "/") {
+		return PackageSpec{}, false
+	}
+
+	segments := strings.Split(p[:sep], "/")
+	identSegment := segments[len(segments)-1]
+	if !strings.HasPrefix(identSegment, "@") && len(segments) >= 2 && strings.HasPrefix(segments[len(segments)-2], "@") {
+		identSegment = segments[len(segments)-2] + "/" + identSegment
+	}
+	if identSegment == "" {
+		return PackageSpec{}, false
+	}
+
+	ident, err := url.PathUnescape(identSegment)
+	if err != nil {
+		return PackageSpec{}, false
+	}
+
+	var scope string
+	name := ident
+	if strings.HasPrefix(ident, "@") {
+		slash := strings.IndexByte(ident, '/')
+		if slash < 0 {
+			return PackageSpec{}, false
+		}
+		scope = ident[1:slash]
+		name = ident[slash+1:]
+		if scope == "" || name == "" {
+			return PackageSpec{}, false
+		}
+	} else if strings.Contains(ident, "/") {
+		return PackageSpec{}, false
+	}
+
+	base := strings.TrimSuffix(basename, ".tgz")
+	version, ok := strings.CutPrefix(base, name+"-")
+	if !ok || version == "" {
+		return PackageSpec{}, false
+	}
+	return PackageSpec{Scope: scope, Name: name, Version: version}, true
 }
 
 // SplitIdentAndSuffix splits "<ident>@<suffix>" at the correct "@" - the one

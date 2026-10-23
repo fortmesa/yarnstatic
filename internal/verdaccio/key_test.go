@@ -43,6 +43,44 @@ func TestSplitIdentAndSuffix(t *testing.T) {
 	}
 }
 
+func TestParseTarballURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want PackageSpec
+		ok   bool
+	}{
+		{"unscoped", "https://registry.example/lodash/-/lodash-4.17.21.tgz", PackageSpec{Name: "lodash", Version: "4.17.21"}, true},
+		{"scoped, encoded", "https://registry.example/@babel%2fcore/-/core-7.20.0.tgz", PackageSpec{Scope: "babel", Name: "core", Version: "7.20.0"}, true},
+		{"scoped, upper-case encoding", "https://registry.example/@babel%2Fcore/-/core-7.20.0.tgz", PackageSpec{Scope: "babel", Name: "core", Version: "7.20.0"}, true},
+		{"scoped, unencoded retry", "https://registry.example/@babel/core/-/core-7.20.0.tgz", PackageSpec{Scope: "babel", Name: "core", Version: "7.20.0"}, true},
+		{"registry path, unscoped", "https://host/artifactory/api/npm/npm-remote/lodash/-/lodash-4.17.21.tgz", PackageSpec{Name: "lodash", Version: "4.17.21"}, true},
+		{"registry path, scoped encoded", "https://host/artifactory/api/npm/npm-remote/@babel%2fcore/-/core-7.20.0.tgz", PackageSpec{Scope: "babel", Name: "core", Version: "7.20.0"}, true},
+		{"registry path, scoped unencoded", "https://host/registry/@babel/core/-/core-7.20.0.tgz", PackageSpec{Scope: "babel", Name: "core", Version: "7.20.0"}, true},
+		{"query string ignored", "https://registry.example/lodash/-/lodash-4.17.21.tgz?x=1", PackageSpec{Name: "lodash", Version: "4.17.21"}, true},
+		{"prerelease version", "https://registry.example/foo/-/foo-1.0.0-beta.1.tgz", PackageSpec{Name: "foo", Version: "1.0.0-beta.1"}, true},
+		{"basename names another package", "https://registry.example/lodash/-/other-1.0.0.tgz", PackageSpec{}, false},
+		{"empty version", "https://registry.example/lodash/-/lodash-.tgz", PackageSpec{}, false},
+		{"not a tgz", "https://registry.example/lodash/-/lodash-1.0.0.zip", PackageSpec{}, false},
+		{"no ident", "https://registry.example/-/lodash-1.0.0.tgz", PackageSpec{}, false},
+		{"no separator", "https://registry.example/lodash/lodash-1.0.0.tgz", PackageSpec{}, false},
+		{"basename has a slash", "https://registry.example/lodash/-/sub/lodash-1.0.0.tgz", PackageSpec{}, false},
+		{"scope without name", "https://registry.example/@babel/-/core-1.0.0.tgz", PackageSpec{}, false},
+		{"empty scope", "https://registry.example/@/core/-/core-1.0.0.tgz", PackageSpec{}, false},
+		{"registry path containing /-/", "https://host/-/mirror/lodash/-/lodash-4.17.21.tgz", PackageSpec{Name: "lodash", Version: "4.17.21"}, true},
+		{"bad percent-encoding", "https://registry.example/%zz/-/x-1.0.0.tgz", PackageSpec{}, false},
+		{"not a URL", "lodash-4.17.21.tgz", PackageSpec{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseTarballURL(tc.in)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("ParseTarballURL(%q) = %+v, %v; want %+v, %v", tc.in, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
 func TestSplitIdent(t *testing.T) {
 	cases := []struct {
 		name      string

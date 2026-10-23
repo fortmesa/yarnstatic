@@ -46,17 +46,18 @@ function exitCodeForKind(kind) {
 // and shadow YARNSTATIC_KEY_PREFIX entirely).
 const defaultKeyPrefix = 'verdaccio';
 
-// resolveFlag implements the "flag wins if set, else env var, else empty"
-// rule shared by check/fetch/serve.
-function resolveFlag(flagVal, envVar) {
+// resolveFlag implements the "flag wins if set, else env var, else the
+// .yarnrc.yml value, else empty" rule shared by check/fetch/serve. Only
+// check reads .yarnrc.yml; fetch and serve leave rcVal out.
+function resolveFlag(flagVal, envVar, rcVal = '') {
   if (flagVal) return flagVal;
-  return process.env[envVar] || '';
+  return process.env[envVar] || rcVal || '';
 }
 
-// requireBucket resolves --bucket from either the flag or
-// YARNSTATIC_BUCKET, throwing if neither is set.
-function requireBucket(flagVal) {
-  const bucket = resolveFlag(flagVal, 'YARNSTATIC_BUCKET');
+// requireBucket resolves --bucket from the flag, YARNSTATIC_BUCKET or
+// yarnstaticBucket, throwing if none is set.
+function requireBucket(flagVal, rcVal = '') {
+  const bucket = resolveFlag(flagVal, 'YARNSTATIC_BUCKET', rcVal);
   if (!bucket) {
     throw new Error('--bucket is required (or set YARNSTATIC_BUCKET)');
   }
@@ -66,16 +67,18 @@ function requireBucket(flagVal) {
 // resolveCommonFlags validates and merges the S3 connection flags shared
 // by check, fetch, and serve ({bucket, keyPrefix, region, endpoint,
 // profile} as parsed by argparse.js) with their YARNSTATIC_* env var
-// fallbacks. Mirrors commonFlags.resolve() in config.go. Throws on a
-// missing bucket (the exitConfiguration case, see above).
-function resolveCommonFlags(flags) {
-  const bucket = requireBucket(flags.bucket);
-  let keyPrefix = resolveFlag(flags.keyPrefix, 'YARNSTATIC_KEY_PREFIX');
+// fallbacks, then rc's .yarnrc.yml values (check passes yarnrc.js's
+// loadYarnrc() result; the precedence yarn-plugin-yarnstatic-s3 uses).
+// Mirrors commonFlags.resolveWith() in config.go. Throws on a missing
+// bucket (the exitConfiguration case, see above).
+function resolveCommonFlags(flags, rc = {}) {
+  const bucket = requireBucket(flags.bucket, rc.bucket);
+  let keyPrefix = resolveFlag(flags.keyPrefix, 'YARNSTATIC_KEY_PREFIX', rc.keyPrefix);
   if (!keyPrefix) keyPrefix = defaultKeyPrefix;
   const s3opts = {
-    region: resolveFlag(flags.region, 'YARNSTATIC_REGION'),
-    endpoint: resolveFlag(flags.endpoint, 'YARNSTATIC_ENDPOINT'),
-    profile: resolveFlag(flags.profile, 'YARNSTATIC_PROFILE'),
+    region: resolveFlag(flags.region, 'YARNSTATIC_REGION', rc.region),
+    endpoint: resolveFlag(flags.endpoint, 'YARNSTATIC_ENDPOINT', rc.endpoint),
+    profile: resolveFlag(flags.profile, 'YARNSTATIC_PROFILE', rc.profile),
   };
   return {bucket, keyPrefix, s3opts};
 }

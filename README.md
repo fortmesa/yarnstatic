@@ -55,7 +55,9 @@ curl -fsSL https://raw.githubusercontent.com/fortmesa/yarnstatic/main/install.sh
 This places the binary at `~/.yarn/bin/yarnstatic`, one of the locations
 the Yarn plugin already searches (see
 [`docs/plugin.md`](docs/plugin.md#binary-resolution)), so no `PATH` changes
-are required for the plugin to find it.
+are required for the plugin to find it. The script checks each download
+against the release's `checksums.txt` before anything reaches its final
+path, so a mismatch leaves an earlier install as it was.
 
 Or build from source:
 

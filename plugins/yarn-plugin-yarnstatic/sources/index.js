@@ -121,9 +121,25 @@ function isExecutable(candidate) {
 }
 
 /**
+ * Reports whether candidate resolves (symlinks followed) to a file inside
+ * the packageDir directory. False if either path doesn't exist.
+ */
+function isInsideDir(candidate, packageDir) {
+  try {
+    const rel = path.relative(fs.realpathSync(packageDir), fs.realpathSync(candidate));
+    return rel !== '' && !path.isAbsolute(rel) && rel.split(path.sep)[0] !== '..';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Resolves the yarnstatic binary to invoke, checking in order:
  *   1. YARNSTATIC_BIN env var (explicit override, always wins)
- *   2. <projectRoot>/node_modules/.bin/yarnstatic (local devDependency)
+ *   2. <projectRoot>/node_modules/.bin/yarnstatic (local devDependency),
+ *      but only when it resolves into node_modules/@fortmesa/yarnstatic.
+ *      Any other dependency can declare a `yarnstatic` bin, and this runs
+ *      it with the AWS environment even under enableScripts: false.
  *   3. $GOBIN, $GOPATH/bin, or ~/go/bin (a `go install`-produced binary)
  *   4. ~/.yarn/bin/yarnstatic (Yarn's own per-user bin directory - the
  *      same one classic Yarn 1.x installs global binaries into, often
@@ -138,12 +154,16 @@ function resolveBinary(projectRoot) {
     return process.env.YARNSTATIC_BIN;
   }
 
+  if (projectRoot) {
+    const local = path.join(projectRoot, 'node_modules', '.bin', 'yarnstatic');
+    const packageDir = path.join(projectRoot, 'node_modules', '@fortmesa', 'yarnstatic');
+    if (isExecutable(local) && isInsideDir(local, packageDir)) {
+      return local;
+    }
+  }
+
   const home = os.homedir();
   const candidates = [];
-
-  if (projectRoot) {
-    candidates.push(path.join(projectRoot, 'node_modules', '.bin', 'yarnstatic'));
-  }
 
   const goBin = process.env.GOBIN || (process.env.GOPATH && path.join(process.env.GOPATH, 'bin'));
   candidates.push(path.join(goBin || path.join(home, 'go', 'bin'), 'yarnstatic'));
@@ -178,8 +198,16 @@ function ensureDaemon(projectRoot) {
   return daemonPromise;
 }
 
-function startDaemon(projectRoot) {
-  const socketPath = path.join(os.tmpdir(), `yarnstatic-${process.pid}.sock`);
+function startDaemon(projectRoot, {readyTimeoutMs = READY_TIMEOUT_MS} = {}) {
+  // mkdtemp creates the directory 0700 under a random name, so no other
+  // user can pre-create the socket path or connect to the socket inside it.
+  let socketDir;
+  try {
+    socketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yarnstatic-'));
+  } catch (err) {
+    return Promise.reject(new Error(`failed to create a private socket directory: ${err.message}`));
+  }
+  const socketPath = path.join(socketDir, 'daemon.sock');
   const bin = resolveBinary(projectRoot);
 
   const child = spawn(bin, ['serve', '--socket', socketPath], {
@@ -208,56 +236,79 @@ function startDaemon(projectRoot) {
     } catch {
       // already dead - nothing to do
     }
+    try {
+      fs.rmSync(socketDir, {recursive: true, force: true});
+    } catch {
+      // best-effort - the daemon removes its own socket file on shutdown
+    }
   });
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let probe = null;
 
-    child.once('exit', (code, signal) => {
+    // One deadline for the whole wait, connecting and reading the greeting
+    // alike: a listener that accepts but never sends a full line must not
+    // hang the install.
+    const deadlineTimer = setTimeout(() => {
+      fail(new Error(`yarnstatic serve did not become ready within ${readyTimeoutMs}ms`));
+    }, readyTimeoutMs);
+
+    function fail(err) {
       if (settled) return;
       settled = true;
-      reject(new Error(
+      clearTimeout(deadlineTimer);
+      if (probe) probe.destroy();
+      reject(err);
+    }
+
+    child.once('exit', (code, signal) => {
+      fail(new Error(
         `yarnstatic serve exited before becoming ready (code=${code}, signal=${signal}): ${stderr.trim()}`
       ));
     });
     child.once('error', (err) => {
-      if (settled) return;
-      settled = true;
-      reject(new Error(`failed to spawn ${bin}: ${err.message}`));
+      fail(new Error(`failed to spawn ${bin}: ${err.message}`));
     });
 
-    const deadline = Date.now() + READY_TIMEOUT_MS;
     const tryConnect = () => {
       if (settled) return;
-      const probe = net.createConnection(socketPath);
+      const conn = net.createConnection(socketPath);
+      probe = conn;
       let buf = Buffer.alloc(0);
-      probe.on('data', (chunk) => {
+      let handled = false;
+
+      // A refused connect, or a connection that ends before a full
+      // greeting line, both mean "not ready yet": try again until the
+      // deadline.
+      const retry = () => {
+        if (handled) return;
+        handled = true;
+        conn.destroy();
+        if (!settled) setTimeout(tryConnect, READY_POLL_INTERVAL_MS);
+      };
+
+      conn.on('data', (chunk) => {
+        if (handled) return;
         buf = Buffer.concat([buf, chunk]);
         const newlineIndex = buf.indexOf(0x0a);
         if (newlineIndex < 0) return;
+        handled = true;
         const line = buf.slice(0, newlineIndex).toString('utf8');
-        probe.end();
+        conn.end();
         if (settled) return;
         try {
           checkGreeting(line);
         } catch (err) {
-          settled = true;
-          reject(err);
+          fail(err);
           return;
         }
         settled = true;
+        clearTimeout(deadlineTimer);
         resolve({socketPath, child});
       });
-      probe.once('error', () => {
-        probe.destroy();
-        if (settled) return;
-        if (Date.now() >= deadline) {
-          settled = true;
-          reject(new Error(`yarnstatic serve did not become ready within ${READY_TIMEOUT_MS}ms`));
-          return;
-        }
-        setTimeout(tryConnect, READY_POLL_INTERVAL_MS);
-      });
+      conn.on('error', retry);
+      conn.on('end', retry);
     };
     tryConnect();
   });
@@ -382,9 +433,13 @@ function fetchFromDaemon(socketPath, packageSpec, storageFolder) {
  *   {registry}/{identUrl}/-/{basename}-{version}.tgz
  * where identUrl is "/name" or "/@scope%2fname" (NpmSemverFetcher retries
  * with an unencoded "/@scope/name" on a first-attempt failure, so both
- * forms are accepted here). Returns "name@version" or "@scope/name@version"
- * for the daemon protocol, or null if target isn't a recognized npm
- * tarball URL.
+ * forms are accepted here). The registry URL can carry a path of its own
+ * (Artifactory, Nexus, a path-mounted Verdaccio), so the ident is read from
+ * the last one or two path segments before the final "/-/" and anything
+ * ahead of it is ignored. A registry path whose last segment starts with
+ * "@" reads as a scope, since it looks the same as the unencoded form.
+ * Returns "name@version" or "@scope/name@version" for the daemon protocol,
+ * or null if target isn't a recognized npm tarball URL.
  */
 function parseTarballUrl(target) {
   let url;
@@ -394,10 +449,13 @@ function parseTarballUrl(target) {
     return null;
   }
 
-  const sepIndex = url.pathname.indexOf('/-/');
+  const sepIndex = url.pathname.lastIndexOf('/-/');
   if (sepIndex < 0) return null;
 
-  const identSegment = url.pathname.slice(1, sepIndex);
+  const segments = url.pathname.slice(0, sepIndex).split('/');
+  const last = segments[segments.length - 1];
+  const prev = segments.length > 2 ? segments[segments.length - 2] : '';
+  const identSegment = !last.startsWith('@') && prev.startsWith('@') ? `${prev}/${last}` : last;
   const basename = url.pathname.slice(sepIndex + 3);
   if (identSegment === '' || !basename.endsWith('.tgz') || basename.includes('/')) {
     return null;
@@ -417,6 +475,7 @@ function parseTarballUrl(target) {
     if (slash < 0) return null;
     scope = ident.slice(1, slash);
     name = ident.slice(slash + 1);
+    if (!scope || !name) return null;
   } else if (ident.includes('/')) {
     return null;
   }
@@ -678,6 +737,8 @@ module.exports._test = {
   parseVersion,
   compareVersions,
   checkGreeting,
+  resolveBinary,
+  startDaemon,
   parseTarballUrl,
   scopeOf,
   splitPackageSpec,

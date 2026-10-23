@@ -58,9 +58,24 @@ function greeting() {
 // both accepted (nc/telnet-style manual testing tends to send "\r\n").
 // Throws (a JSON syntax error) on malformed input -- callers format that
 // into the "malformed request: ..." response message themselves.
+//
+// The shape checks match Go's typed json.Unmarshal into its request
+// struct. A JSON null decodes to an empty request, which fails later as an
+// invalid package spec. A non-object, or a field that isn't a string, is
+// malformed.
 function parseRequestLine(line) {
   const trimmed = line.replace(/[\r\n]+$/, '');
-  return JSON.parse(trimmed);
+  const req = JSON.parse(trimmed);
+  if (req === null) return {};
+  if (typeof req !== 'object' || Array.isArray(req)) {
+    throw new Error('request is not a JSON object');
+  }
+  for (const field of ['package', 'storageFolder', 'ver']) {
+    if (req[field] !== undefined && req[field] !== null && typeof req[field] !== 'string') {
+      throw new Error(`request field "${field}" is not a string`);
+    }
+  }
+  return req;
 }
 
 // writeJSONLine writes one JSON object as a line (with a trailing "\n") to
