@@ -17,15 +17,13 @@ import (
 	"yarnstatic/internal/s3client"
 )
 
-// fakeS3 serves path-style HEAD/GET for the given "bucket/key" objects and
-// 404s everything else. It also points the AWS SDK at static credentials
-// and away from the developer's own config, so nothing here can reach AWS.
-func fakeS3(t *testing.T, objects map[string]string) *httptest.Server {
+// isolateAWS points the AWS SDK at static credentials (or none, with
+// withCreds false) and away from the developer's own config files and
+// IMDS, so nothing a test does can pick up real credentials.
+func isolateAWS(t *testing.T, withCreds bool) {
 	t.Helper()
 	dir := t.TempDir()
 	for k, v := range map[string]string{
-		"AWS_ACCESS_KEY_ID":           "test",
-		"AWS_SECRET_ACCESS_KEY":       "test",
 		"AWS_REGION":                  "us-east-1",
 		"AWS_EC2_METADATA_DISABLED":   "true",
 		"AWS_CONFIG_FILE":             filepath.Join(dir, "config"),
@@ -33,10 +31,24 @@ func fakeS3(t *testing.T, objects map[string]string) *httptest.Server {
 	} {
 		t.Setenv(k, v)
 	}
-	for _, k := range []string{"AWS_PROFILE", "AWS_SESSION_TOKEN", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"} {
+	unset := []string{"AWS_PROFILE", "AWS_SESSION_TOKEN", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"}
+	if withCreds {
+		t.Setenv("AWS_ACCESS_KEY_ID", "test")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	} else {
+		unset = append(unset, "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+	}
+	for _, k := range unset {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
 	}
+}
+
+// fakeS3 serves path-style HEAD/GET for the given "bucket/key" objects and
+// 404s everything else, with the SDK isolated by isolateAWS.
+func fakeS3(t *testing.T, objects map[string]string) *httptest.Server {
+	t.Helper()
+	isolateAWS(t, true)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, ok := objects[strings.TrimPrefix(r.URL.Path, "/")]
@@ -201,6 +213,34 @@ func TestFetchWriteFailureIsAUsageError(t *testing.T) {
 	}
 	if code := run(append(args, "--out", "/dev/full")); code != exitUsage {
 		t.Fatalf("fetch to /dev/full: exit %d, want %d (a local write failure)", code, exitUsage)
+	}
+}
+
+// TestLocalFailureExitCodes runs fetch through the real SDK with settings
+// it rejects before sending anything (or with an endpoint nothing listens
+// on), so an SDK upgrade that changes an error's shape shows up as a wrong
+// exit code here. See docs/cli.md's exit code tables.
+func TestLocalFailureExitCodes(t *testing.T) {
+	cases := []struct {
+		name      string
+		withCreds bool
+		flags     []string
+		want      int
+	}{
+		{"malformed endpoint", true, []string{"--endpoint", "not a url"}, exitConfiguration},
+		{"invalid region", true, []string{"--region", "bad region!"}, exitConfiguration},
+		{"profile that doesn't exist", false, []string{"--profile", "does-not-exist", "--endpoint", "http://127.0.0.1:1"}, exitConfiguration},
+		{"no credentials at all", false, []string{"--endpoint", "http://127.0.0.1:1"}, exitNoCredentials},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateEnv(t)
+			isolateAWS(t, tc.withCreds)
+			args := append([]string{"fetch", "--bucket", "b", "--package", "lodash@4.17.21", "--out", filepath.Join(t.TempDir(), "out")}, tc.flags...)
+			if got := run(args); got != tc.want {
+				t.Fatalf("run(%v) = %d, want %d", args, got, tc.want)
+			}
+		})
 	}
 }
 

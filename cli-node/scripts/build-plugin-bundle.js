@@ -15,7 +15,9 @@ const path = require('node:path');
 const {execFileSync} = require('node:child_process');
 
 const PLUGIN_DIR = path.resolve(__dirname, '..', '..', 'plugins', 'yarn-plugin-yarnstatic-s3');
-const SOURCE_FILE = path.join(PLUGIN_DIR, 'sources', 'index.js');
+// The bundle inlines the plugin's dependencies, so a newer package.json or
+// yarn.lock (a dependency bump with no source change) makes it stale too.
+const INPUT_FILES = ['sources/index.js', 'package.json', 'yarn.lock'].map(f => path.join(PLUGIN_DIR, f));
 const BUNDLE_FILE = path.join(PLUGIN_DIR, 'bundles', '@yarnpkg', 'plugin-yarnstatic-s3.js');
 const OUT_DIR = path.resolve(__dirname, '..', 'plugin');
 const OUT_FILE = path.join(OUT_DIR, 'plugin-yarnstatic-s3.cjs');
@@ -23,8 +25,7 @@ const OUT_FILE = path.join(OUT_DIR, 'plugin-yarnstatic-s3.cjs');
 function needsBuild() {
   if (!fs.existsSync(BUNDLE_FILE)) return true;
   const bundleTime = fs.statSync(BUNDLE_FILE).mtimeMs;
-  const sourceTime = fs.statSync(SOURCE_FILE).mtimeMs;
-  return sourceTime > bundleTime;
+  return INPUT_FILES.some(f => fs.statSync(f).mtimeMs > bundleTime);
 }
 
 function main() {

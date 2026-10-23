@@ -466,3 +466,78 @@ jobs:
         if: steps.version-check.outputs.should-publish == 'true'
         working-directory: cli-node
         run: yarn npm publish --access public --provenance
+
+  publish-npmjs:
+    name: Publish @fortmesa/yarnstatic to npmjs.org
+    # Reuses build-js's bundle for the same reason publish-npm does: one
+    # build of yarn-plugin-yarnstatic-s3 per run, shipped everywhere.
+    needs: build-js
+    runs-on: ubuntu-slim
+    # The trusted publisher entry for @fortmesa/yarnstatic on npmjs.com
+    # names this environment, so npm only honors an OIDC token from a job
+    # running in it. The environment's v*.*.* tag rule limits which runs
+    # get one.
+    environment: npmjs
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # No token is configured for registry.npmjs.org, so `yarn npm publish`
+      # trades this job's GitHub OIDC token for a short-lived publish token
+      # (npm trusted publishing).
+      YARN_NPM_REGISTRY_SERVER: https://registry.npmjs.org
+      YARN_NPM_PUBLISH_REGISTRY: https://registry.npmjs.org
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0   # v7
+        with:
+          persist-credentials: false
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Restore cli-node node_modules from install job
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: |
+            cli-node/node_modules
+            cli-node/.yarn/install-state.gz
+          key: node-modules-cli-node-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      - name: Download pre-built yarn-plugin-yarnstatic-s3 bundle from build-js
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          name: plugin-bundle-yarn-plugin-yarnstatic-s3
+          path: plugins/yarn-plugin-yarnstatic-s3/bundles/@yarnpkg
+
+      # The public registry needs no auth to read, so this asks it directly
+      # and tells the three answers apart: 200 means already published
+      # (skip), 404 means publish, and anything else fails the job instead
+      # of guessing.
+      - name: Check whether this version is already on npmjs.org
+        id: version-check
+        working-directory: cli-node
+        run: |
+          set -eu
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://registry.npmjs.org/@fortmesa%2fyarnstatic/$LOCAL_VERSION")
+          case "$STATUS" in
+            200)
+              echo "@fortmesa/yarnstatic@$LOCAL_VERSION is already on npmjs.org -- skipping"
+              echo "should-publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "@fortmesa/yarnstatic@$LOCAL_VERSION is not on npmjs.org yet -- will publish"
+              echo "should-publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unexpected HTTP $STATUS from registry.npmjs.org for @fortmesa/yarnstatic@$LOCAL_VERSION" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Publish to npmjs.org
+        if: steps.version-check.outputs.should-publish == 'true'
+        working-directory: cli-node
+        run: yarn npm publish --access public --provenance

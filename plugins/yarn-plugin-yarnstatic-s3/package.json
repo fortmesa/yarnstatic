@@ -1,6 +1,6 @@
 {
   "name": "yarn-plugin-yarnstatic-s3",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Yarn Berry plugin: same npm-tarball-from-S3 interception as ../yarn-plugin-yarnstatic, but calling @aws-sdk/client-s3 directly instead of a separate yarnstatic serve daemon over a Unix socket.",
   "license": "MIT",

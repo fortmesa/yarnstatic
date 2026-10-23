@@ -25,9 +25,12 @@ const fs = require('node:fs');
 const {S3Client, S3ServiceException} = require('@aws-sdk/client-s3');
 let lastCommand = null;
 let sendImpl = async () => ({Body: (async function* () {})()});
+// Kept for the "local failure exit codes" checks, which need the SDK's own
+// validation to run (and never let a request leave this machine).
+const realSend = S3Client.prototype.send;
 S3Client.prototype.send = async function (command) {
   lastCommand = command;
-  return sendImpl(command);
+  return sendImpl.call(this, command);
 };
 
 const key = require('../src/verdaccio/key');
@@ -1059,6 +1062,45 @@ __metadata:
       assert.equal(await runFetch([...args, '--out', '/dev/full']), config.exitUsage);
     }
   });
+
+  // Mirrors fakes3_test.go's TestLocalFailureExitCodes, through the real
+  // SDK: settings it rejects before sending anything, or an endpoint
+  // nothing listens on. The profile case is the documented divergence from
+  // Go (exit 4 here, 3 there). See src/s3client/client.js's classify().
+  {
+    const {runFetch} = require('../src/commands/fetch');
+    const savedEnv = {...process.env};
+    const awsEnv = withCreds => {
+      for (const k of Object.keys(process.env)) if (k.startsWith('AWS_')) delete process.env[k];
+      process.env.AWS_REGION = 'us-east-1';
+      process.env.AWS_EC2_METADATA_DISABLED = 'true';
+      process.env.AWS_CONFIG_FILE = path.join(TEST_ROOT, 'aws-config');
+      process.env.AWS_SHARED_CREDENTIALS_FILE = path.join(TEST_ROOT, 'aws-credentials');
+      if (withCreds) {
+        process.env.AWS_ACCESS_KEY_ID = 'test';
+        process.env.AWS_SECRET_ACCESS_KEY = 'test';
+      }
+    };
+    const localFailureCases = [
+      ['malformed endpoint', true, ['--endpoint', 'not a url'], config.exitConfiguration],
+      ['invalid region', true, ['--region', 'bad region!'], config.exitConfiguration],
+      ["profile that doesn't exist", false, ['--profile', 'does-not-exist', '--endpoint', 'http://127.0.0.1:1'], config.exitNoCredentials],
+      ['no credentials at all', false, ['--endpoint', 'http://127.0.0.1:1'], config.exitNoCredentials],
+    ];
+    sendImpl = function (command) { return realSend.call(this, command); };
+    try {
+      for (const [name, withCreds, flags, want] of localFailureCases) {
+        await check(`local failure exit codes: ${name}`, async () => {
+          awsEnv(withCreds);
+          const out = path.join(TEST_ROOT, 'local-failure.tgz');
+          assert.equal(await runFetch(['--bucket', 'b', '--package', 'lodash@4.17.21', '--out', out, ...flags]), want);
+        });
+      }
+    } finally {
+      for (const k of Object.keys(process.env)) if (!(k in savedEnv)) delete process.env[k];
+      Object.assign(process.env, savedEnv);
+    }
+  }
 
   fs.rmSync(TEST_ROOT, {recursive: true, force: true});
 

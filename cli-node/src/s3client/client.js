@@ -75,7 +75,7 @@ const accessDeniedCodes = new Set([
 // text.
 //
 // Verified directly against the actually-installed SDK
-// (@aws-sdk/client-s3@3.1079.0) with local-only scenarios (no live AWS
+// (@aws-sdk/client-s3@3.1153.0) with local-only scenarios (no live AWS
 // network access -- fake static credentials plus a bad --region/--endpoint
 // value, so nothing past local validation ever gets dispatched):
 //   - no credentials resolvable at all -> CredentialsProviderError,
@@ -83,14 +83,20 @@ const accessDeniedCodes = new Set([
 //   - a --profile that doesn't exist -> CredentialsProviderError, message
 //     "Could not resolve credentials using profile: [...] in
 //     configuration/credentials file(s)."
-//   - a malformed --endpoint URL -> EndpointError, message "Custom
-//     endpoint `...` was not a valid URI"
+//   - a malformed --endpoint URL -> Node's own TypeError from new URL(),
+//     code ERR_INVALID_URL, message "Invalid URL". 3.1079.0 threw
+//     EndpointError ("Custom endpoint `...` was not a valid URI") instead,
+//     so both are handled. The endpoint is the only URL parsed before a
+//     request is sent, so ERR_INVALID_URL means the --endpoint value.
 //   - an invalid --region string -> a PLAIN Error (constructor/name both
 //     "Error", no typed class at all), message "Region not accepted:
 //     region=\"...\" is not a valid hostname component." -- this is why
 //     the substring fallback below still matters even though the other
-//     three local-failure cases are typed: region-format validation
-//     doesn't get its own error class in this SDK version.
+//     local-failure cases are typed: region-format validation doesn't get
+//     its own error class in this SDK version.
+//
+// test/smoke.js's "local failure exit codes" checks run these scenarios
+// through the real SDK, so a shape change in a later SDK fails the tests.
 function classify(err) {
   if (err == null) return ErrorKind.KindOther;
 
@@ -104,7 +110,7 @@ function classify(err) {
     return ErrorKind.KindOther;
   }
 
-  if (err.name === 'EndpointError') return ErrorKind.KindConfiguration;
+  if (err.name === 'EndpointError' || err.code === 'ERR_INVALID_URL') return ErrorKind.KindConfiguration;
   if (err.name === 'CredentialsProviderError') return ErrorKind.KindNoCredentials;
 
   const msg = String(err.message || err).toLowerCase();

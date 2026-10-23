@@ -94,28 +94,38 @@ committed.
 
 ### Publishing
 
-This package publishes only through `../.github/workflows/release.yml`'s
-`publish-npm` job, triggered by the same `v*.*.*` tag push as every other
-release artifact in this repo -- there is no manual publish path, and
-`yarn npm publish` should never be run by hand from a workstation. That job
-authenticates to `npmjs.dev.fort.blue` via a GitHub Actions OIDC token
-(same pattern as `verdaccio-security-filter`'s own release pipeline), and
-skips cleanly if `package.json`'s version is already published (this
-package's version is independent of the repo's own git tags, same as
-`yarn-plugin-yarnstatic-s3`'s own `package.json` version already is -- bump
-it manually before tagging a release that should also publish a new
-version of this package).
+This package publishes only through `../.github/workflows/release.yml`,
+triggered by the same `v*.*.*` tag push as every other release artifact in
+this repo. Two jobs publish the same version. `publish-npm` sends it to
+`npmjs.dev.fort.blue`, which accepts the job's GitHub Actions OIDC token
+directly (same pattern as `verdaccio-security-filter`'s own release
+pipeline). `publish-npmjs` sends it to registry.npmjs.org from the `npmjs`
+GitHub environment, which the package's trusted-publisher entry on
+npmjs.com names, and `yarn npm publish` trades the job's OIDC token for a
+publish token. Neither job stores a token, and each skips cleanly if
+`package.json`'s version is already on its registry. This package's
+version is independent of the repo's own git tags, the same as
+`yarn-plugin-yarnstatic-s3`'s, so bump it before tagging a release that
+should publish a new version of this package.
+
+Don't run `yarn npm publish` by hand. The one exception was 1.1.0 on
+npmjs.org, published from a workstation so the package existed before its
+trusted publisher could be set up.
 
 ### `classify()` verification status
 
 `src/s3client/client.js`'s `classify()` local-failure branches were
-verified against the actually-installed SDK (`@aws-sdk/client-s3@3.1079.0`)
+verified against the actually-installed SDK (`@aws-sdk/client-s3@3.1153.0`)
 using only local-validation scenarios -- fake static credentials plus a
 bad `--region`/`--endpoint` value, so nothing ever reaches a real AWS
-endpoint. Confirmed real shapes:
+endpoint. `test/smoke.js` runs the same scenarios through the real SDK and
+checks each exit code. Confirmed real shapes:
 - no credentials resolvable at all -> `CredentialsProviderError`
 - a `--profile` that doesn't exist -> `CredentialsProviderError`
-- a malformed `--endpoint` URL -> `EndpointError`
+- a malformed `--endpoint` URL -> Node's own `TypeError` with code
+  `ERR_INVALID_URL`. Up to 3.1079.0 this was `EndpointError`, and the
+  upgrade to 3.1153.0 in 1.1.0 turned exit code 3 into 6 until `classify()`
+  learned the new shape in 1.1.1.
 - an invalid `--region` string -> a **plain `Error`**, no typed class at
   all (`"Region not accepted: region=\"...\" is not a valid hostname
   component."`) -- this is why `classify()`'s message-substring fallback
