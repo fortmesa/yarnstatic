@@ -441,29 +441,7 @@ jobs:
           yarn config set 'npmScopes.fortmesa.npmAlwaysAuth' true
           yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
 
-      # cli-node/package.json's version is independent of this repo's own
-      # v*.*.* git tags (same as yarn-plugin-yarnstatic-s3's own
-      # package.json version already is -- neither plugin's version is
-      # tied to the Go binary's release tag). Most tags won't bump it, and
-      # npm rejects republishing an already-published version outright, so
-      # skip cleanly here instead of failing the whole release whenever
-      # there's nothing new to publish.
-      - name: Check whether this version is already published
-        id: version-check
-        working-directory: cli-node
-        run: |
-          set -eu
-          LOCAL_VERSION=$(node -p "require('./package.json').version")
-          if yarn npm info "@fortmesa/yarnstatic@$LOCAL_VERSION" --json >/dev/null 2>&1; then
-            echo "@fortmesa/yarnstatic@$LOCAL_VERSION is already published -- skipping"
-            echo "should-publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "@fortmesa/yarnstatic@$LOCAL_VERSION is not yet published -- will publish"
-            echo "should-publish=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish to npmjs.dev.fort.blue
-        if: steps.version-check.outputs.should-publish == 'true'
         working-directory: cli-node
         run: yarn npm publish --access public --provenance
 
@@ -513,37 +491,6 @@ jobs:
           name: plugin-bundle-yarn-plugin-yarnstatic-s3
           path: plugins/yarn-plugin-yarnstatic-s3/bundles/@yarnpkg
 
-      # The public registry needs no auth to read, so this asks it directly
-      # and tells the three answers apart: 200 means already published
-      # (skip), 404 means publish, and anything else fails the job instead
-      # of guessing.
-      - name: Check whether this version is already on npmjs.org
-        id: version-check
-        working-directory: cli-node
-        run: |
-          set -eu
-          LOCAL_VERSION=$(node -p "require('./package.json').version")
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-            "https://registry.npmjs.org/@fortmesa%2fyarnstatic/$LOCAL_VERSION")
-          case "$STATUS" in
-            200)
-              echo "@fortmesa/yarnstatic@$LOCAL_VERSION is already on npmjs.org -- skipping"
-              echo "should-publish=false" >> "$GITHUB_OUTPUT"
-              ;;
-            404)
-              echo "@fortmesa/yarnstatic@$LOCAL_VERSION is not on npmjs.org yet -- will stage it"
-              echo "should-publish=true" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "unexpected HTTP $STATUS from registry.npmjs.org for @fortmesa/yarnstatic@$LOCAL_VERSION" >&2
-              exit 1
-              ;;
-          esac
-
-      # A staged version stays off the registry until it's approved, so the
-      # check above still answers 404 for it. Approve or reject a pending
-      # stage on npmjs.com before re-running this job.
       - name: Stage on npmjs.org for approval
-        if: steps.version-check.outputs.should-publish == 'true'
         working-directory: cli-node
         run: yarn npm publish --access public --provenance --staged
